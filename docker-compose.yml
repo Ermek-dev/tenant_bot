@@ -1,0 +1,29 @@
+version: "3.8"
+
+services:
+  bot:
+    build: .
+    container_name: tenantbot
+    env_file: .env
+    environment:
+      - DATABASE_PATH=/data/bot.db
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+
+  backup:
+    build: ./backup
+    container_name: tenantbot-backup
+    environment:
+      - DB_PATH=/data/bot.db
+      - BACKUP_DIR=/backups
+      - BACKUP_INTERVAL_SEC=3600
+      - BACKUP_KEEP_DAYS=14
+      - TZ=UTC
+    depends_on:
+      - bot
+    volumes:
+      - ./data:/data:ro
+      - ./backups:/backups
+    restart: unless-stopped
+

@@ -1,0 +1,14 @@
+.venv
+__pycache__
+*.pyc
+.git
+.gitignore
+.env
+data
+backups
+dist
+build
+node_modules
+*.log
+*.sqlite
+*.db
