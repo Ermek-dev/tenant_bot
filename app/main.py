@@ -19,6 +19,8 @@ from app.keyboards import (
     CATEGORIES,
     categories_inline_kb,
     enter_company_code_kb,
+    quick_start_kb,
+    description_nav_kb,
 )
 from app.utils import user_display_name
 
@@ -60,9 +62,12 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             await message.answer("Либо используйте меню ниже.", reply_markup=main_menu())
             return
         await message.answer(
-            "Здравствуйте! 👋 Выберите действие:",
-            reply_markup=main_menu(),
+            "Добрый день!\n"
+            "Вас приветствует чат-бот Сервис РТС ЛТД.\n"
+            "С какой проблемой вы столкнулись?",
+            reply_markup=quick_start_kb(),
         )
+        await message.answer("Выберите действие:", reply_markup=main_menu())
 
     # Category selection via text buttons
     @dp.message(ReportStates.choosing_category)
@@ -74,7 +79,7 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             await message.answer("Категории:", reply_markup=categories_inline_kb())
             return
         await state.update_data(category=mapping[text])
-        await message.answer("Опишите проблему текстом (что случилось, где именно).")
+        await message.answer("Опишите проблему текстом (что случилось, где именно).", reply_markup=description_nav_kb())
         await state.set_state(ReportStates.typing_description)
 
     # Category selection via inline buttons
@@ -84,7 +89,7 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         await state.set_state(ReportStates.typing_description)
         await state.update_data(category=code)
         await cb.answer()
-        await cb.message.answer("Опишите проблему текстом (что случилось, где именно).")
+        await cb.message.answer("Опишите проблему текстом (что случилось, где именно).", reply_markup=description_nav_kb())
 
     # Description capture
     @dp.message(ReportStates.typing_description)
@@ -152,7 +157,8 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             # fall back to message’s chat, but this is PM; so notify user
             await cb.message.answer(
                 "Ваша заявка сохранена (№ {}). Ожидает обработку.\n"
-                "Внимание: не настроен чат сотрудников — администратор должен выполнить /setstaffchat в нужной группе.".format(issue_id)
+                "Внимание: не настроен чат сотрудников — администратор должен выполнить /setstaffchat в нужной группе.".format(issue_id),
+                reply_markup=main_menu(),
             )
         else:
             text = (
@@ -172,7 +178,10 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
                     await bot.send_media_group(staff_chat_id, media)
                     await bot.send_message(staff_chat_id, f"Фото к заявке #{issue_id}")
 
-            await cb.message.answer(f"Спасибо! Ваша заявка отправлена сотрудникам. Номер: #{issue_id}.")
+            await cb.message.answer(
+                f"Спасибо! Ваша заявка отправлена сотрудникам. Номер: #{issue_id}.",
+                reply_markup=main_menu(),
+            )
 
         await state.clear()
 
@@ -268,6 +277,17 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             return
         await state.set_state(ReportStates.choosing_category)
         await message.answer("Выберите категорию:", reply_markup=categories_inline_kb())
+
+    # Quick start: begin new issue via inline button
+    @dp.callback_query(F.data == "new_issue")
+    async def cb_new_issue(cb: CallbackQuery, state: FSMContext):
+        await cb.answer()
+        company = await db.get_user_company(cb.from_user.id)
+        if not company:
+            await cb.message.answer("Сначала привяжите предприятие: /company_join <код>.", reply_markup=enter_company_code_kb())
+            return
+        await state.set_state(ReportStates.choosing_category)
+        await cb.message.answer("Выберите категорию:", reply_markup=categories_inline_kb())
 
     # My issues
     @dp.message(Command("my"))
@@ -413,8 +433,29 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         except Exception:
             pass
 
-        await cb.message.answer(f"Заявка #{issue_id} отмечена как выполненная.")
+        await cb.message.answer(f"Заявка #{issue_id} отмечена как выполненная.", reply_markup=main_menu())
         await state.clear()
+
+    # Inline cancel for any active flow
+    @dp.callback_query(F.data == "cancel_flow")
+    async def cancel_flow(cb: CallbackQuery, state: FSMContext):
+        await state.clear()
+        await cb.answer()
+        await cb.message.answer("Действие отменено.", reply_markup=main_menu())
+
+    # Back: from description to categories
+    @dp.callback_query(F.data == "back_to_categories")
+    async def back_to_categories(cb: CallbackQuery, state: FSMContext):
+        await cb.answer()
+        await state.set_state(ReportStates.choosing_category)
+        await cb.message.answer("Выберите категорию:", reply_markup=categories_inline_kb())
+
+    # Back: from photos to description
+    @dp.callback_query(F.data == "back_to_description")
+    async def back_to_description(cb: CallbackQuery, state: FSMContext):
+        await cb.answer()
+        await state.set_state(ReportStates.typing_description)
+        await cb.message.answer("Опишите проблему текстом (что случилось, где именно).", reply_markup=description_nav_kb())
 
     # Fallback help
     @dp.message(Command("help"))

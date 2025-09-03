@@ -2,10 +2,13 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeybo
 
 
 CATEGORIES = [
-    ("🔧 Сантехника", "plumbing"),
-    ("💡 Свет", "electricity"),
-    ("📄 Документы", "documents"),
-    ("❓ Другая", "other"),
+    ("Сантехника", "plumbing"),
+    ("Электрика", "electricity"),
+    ("Техническая неисправность", "technical_issue"),
+    ("Уборка помещений", "cleaning"),
+    ("IT обслуживание", "it_service"),
+    ("Документооборот", "document_flow"),
+    ("Другое (опишите проблему)", "other"),
 ]
 
 
@@ -32,8 +35,12 @@ def categories_inline_kb() -> InlineKeyboardMarkup:
 
 def skip_or_done_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⏭️ Пропустить", callback_data="skip_photos"),
-         InlineKeyboardButton(text="✅ Отправить", callback_data="done_photos")],
+        [
+            InlineKeyboardButton(text="⏭️ Пропустить", callback_data="skip_photos"),
+            InlineKeyboardButton(text="✅ Отправить", callback_data="done_photos"),
+        ],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_description")],
+        [InlineKeyboardButton(text="⛔️ Отмена", callback_data="cancel_flow")],
     ])
 
 
@@ -50,11 +57,26 @@ def staff_task_kb(issue_id: int, *, assigned_to: str | None) -> InlineKeyboardMa
 
 def send_completion_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📤 Отправить отчёт", callback_data="send_completion")]
+        [InlineKeyboardButton(text="📤 Отправить отчёт", callback_data="send_completion")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_description")],
+        [InlineKeyboardButton(text="⛔️ Отмена", callback_data="cancel_flow")],
     ])
 
 
 def enter_company_code_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔑 Ввести код предприятия", callback_data="company:enter_code")]
+    ])
+
+
+def quick_start_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➡️ Создать заявку", callback_data="new_issue")]
+    ])
+
+
+def description_nav_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад к категориям", callback_data="back_to_categories")],
+        [InlineKeyboardButton(text="⛔️ Отмена", callback_data="cancel_flow")],
     ])
