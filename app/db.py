@@ -114,7 +114,9 @@ async def create_issue(
         (user_id, user_name, category, description, "open", tenant_chat_id, company_id, now, now),
     )
     await conn.commit()
-    return cur.lastrowid
+    # lastrowid can be Optional in type hints, but after INSERT it is set
+    assert cur.lastrowid is not None
+    return int(cur.lastrowid)
 
 
 async def add_issue_photo(issue_id: int, file_id: str, *, is_completion: bool, uploader_user_id: Optional[int]) -> None:
@@ -203,14 +205,18 @@ async def create_company(name: str, invite_code: Optional[str]) -> int:
         (name, code, now),
     )
     await conn.commit()
-    return cur.lastrowid
+    # lastrowid can be Optional in type hints, but after INSERT it is set
+    assert cur.lastrowid is not None
+    return int(cur.lastrowid)
 
 
 async def list_companies() -> List[aiosqlite.Row]:
     conn = _require_conn()
     conn.row_factory = aiosqlite.Row
     async with conn.execute("SELECT * FROM companies ORDER BY id ASC") as cur:
-        return await cur.fetchall()
+        rows = await cur.fetchall()
+        # Some type stubs declare fetchall returns Iterable[Row]; coerce to list
+        return list(rows)
 
 
 async def get_company_by_invite(code: str) -> Optional[aiosqlite.Row]:
@@ -263,7 +269,9 @@ async def user_issues(user_id: int, limit: int = 5) -> List[aiosqlite.Row]:
         "SELECT id, category, status, created_at FROM issues WHERE user_id=? ORDER BY id DESC LIMIT ?",
         (user_id, limit),
     ) as cur:
-        return await cur.fetchall()
+        rows = await cur.fetchall()
+        # Some type stubs declare fetchall returns Iterable[Row]; coerce to list
+        return list(rows)
 
 
 async def _migrate_add_company_id_column() -> None:

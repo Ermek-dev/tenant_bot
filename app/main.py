@@ -1,11 +1,11 @@
 import asyncio
 from contextlib import suppress
-from typing import List, Optional
+from typing import List, Optional, cast
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (CallbackQuery, ContentType, InlineKeyboardMarkup,
-                           InputMediaPhoto, Message)
+                           InputMediaPhoto, Message, MediaUnion)
 from aiogram.fsm.context import FSMContext
 
 from app.config import load_settings
@@ -51,12 +51,15 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     async def cmd_start(message: Message, state: FSMContext):
         await state.clear()
         # Check company binding
+        if message.from_user is None:
+            return
         company = await db.get_user_company(message.from_user.id)
         if not company:
             await message.answer(
-                "Здравствуйте! 👋\n"
+                "Здравствуйте!\n"
+                "Вас приветствует чат-бот Сервис РТС ЛТД.\n"
                 "Чтобы начать, привяжите своё предприятие.\n"
-                "Попросите у администратора код и отправьте его: /company_join <код>\n",
+                "Попросите у администратора код и отправьте его: /company_join <код>",
                 reply_markup=enter_company_code_kb(),
             )
             await message.answer("Либо используйте меню ниже.", reply_markup=main_menu())
@@ -85,11 +88,15 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     # Category selection via inline buttons
     @dp.callback_query(F.data.startswith("cat:"))
     async def choose_category_inline(cb: CallbackQuery, state: FSMContext):
+        if not cb.data:
+            await cb.answer()
+            return
         code = cb.data.split(":", 1)[1]
         await state.set_state(ReportStates.typing_description)
         await state.update_data(category=code)
         await cb.answer()
-        await cb.message.answer("Опишите проблему текстом (что случилось, где именно).", reply_markup=description_nav_kb())
+        if cb.message:
+            await cb.message.answer("Опишите проблему текстом (что случилось, где именно).", reply_markup=description_nav_kb())
 
     # Description capture
     @dp.message(ReportStates.typing_description)
@@ -112,6 +119,8 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         data = await state.get_data()
         photos: List[str] = data.get("photos", [])
         # take highest resolution
+        if not message.photo:
+            return
         file_id = message.photo[-1].file_id
         photos.append(file_id)
         await state.update_data(photos=photos)
@@ -121,7 +130,7 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     async def done_photos(cb: CallbackQuery, state: FSMContext):
         await cb.answer()
         data = await state.get_data()
-        category = data.get("category")
+        category_any = data.get("category")
         description = data.get("description", "")
         photos: List[str] = data.get("photos", [])
 
@@ -130,11 +139,18 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         reporter_user = cb.from_user
         reporter_name = (reporter_user.full_name or reporter_user.username or str(reporter_user.id)) if reporter_user else ""
         # Determine company
+        if cb.from_user is None or cb.message is None:
+            return
         company = await db.get_user_company(cb.from_user.id)
         if not company:
             await cb.message.answer("Сначала привяжите предприятие: используйте /company_join <код>.")
             await state.clear()
             return
+        if not isinstance(category_any, str):
+            await cb.message.answer("Произошла ошибка: категория не выбрана. Пожалуйста, начните заново.")
+            await state.clear()
+            return
+        category = category_any
         issue_id = await db.create_issue(
             user_id=cb.from_user.id,
             user_name=reporter_name,
@@ -156,8 +172,7 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         if staff_chat_id is None:
             # fall back to message’s chat, but this is PM; so notify user
             await cb.message.answer(
-                "Ваша заявка сохранена (№ {}). Ожидает обработку.\n"
-                "Внимание: не настроен чат сотрудников — администратор должен выполнить /setstaffchat в нужной группе.".format(issue_id),
+                f"Благодарим за обращение! Ваша заявка принята. Номер: #{issue_id}.",
                 reply_markup=main_menu(),
             )
         else:
@@ -168,18 +183,34 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
                 f"От: {reporter_name} (id {cb.from_user.id})\n\n"
                 f"Описание:\n{description}"
             )
-            staff_msg = await bot.send_message(chat_id=staff_chat_id, text=text, reply_markup=staff_task_kb(issue_id, assigned_to=None))
-            await db.set_staff_message(issue_id, staff_chat_id, staff_msg.message_id)
+            # If there are photos, send them together with the text by using the
+            # caption on the first media item (Telegram only allows caption on
+            # media, not on media groups' separate messages). After that, send
+            # a separate message with the staff action buttons and store its id
+            # in DB so the bot can edit it later.
             if photos:
                 if len(photos) == 1:
-                    await bot.send_photo(staff_chat_id, photos[0], caption=f"Фото к заявке #{issue_id}")
+                    # Send single photo with the full staff text as caption
+                    await bot.send_photo(staff_chat_id, photos[0], caption=text)
                 else:
+                    # Send media group; put the staff text as caption on the
+                    # first media element (only the first caption is shown).
                     media = [InputMediaPhoto(media=fid) for fid in photos[:10]]  # media group limit
-                    await bot.send_media_group(staff_chat_id, media)
-                    await bot.send_message(staff_chat_id, f"Фото к заявке #{issue_id}")
+                    # attach caption to first media
+                    media[0].caption = text
+                    await bot.send_media_group(staff_chat_id, cast(List[MediaUnion], media))
+
+                # Send a follow-up message that contains the action buttons and
+                # store that message id for later edits.
+                staff_msg = await bot.send_message(chat_id=staff_chat_id, text=f"Заявка #{issue_id}", reply_markup=staff_task_kb(issue_id, assigned_to=None))
+                await db.set_staff_message(issue_id, staff_chat_id, staff_msg.message_id)
+            else:
+                # No photos: send plain text message with buttons as before
+                staff_msg = await bot.send_message(chat_id=staff_chat_id, text=text, reply_markup=staff_task_kb(issue_id, assigned_to=None))
+                await db.set_staff_message(issue_id, staff_chat_id, staff_msg.message_id)
 
             await cb.message.answer(
-                f"Спасибо! Ваша заявка отправлена сотрудникам. Номер: #{issue_id}.",
+                f"Благодарим за обращение! Ваша заявка принята. Номер: #{issue_id}.",
                 reply_markup=main_menu(),
             )
 
@@ -192,6 +223,8 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         if message.chat.type not in {"group", "supergroup"}:
             await message.answer("Выполните эту команду в группе сотрудников.")
             return
+        if message.from_user is None:
+            return
         if admin_ids and (message.from_user.id not in admin_ids):
             await message.answer("Только администраторы могут выполнять эту команду.")
             return
@@ -201,6 +234,8 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     # Admin: create company
     @dp.message(Command("company_create"))
     async def company_create(message: Message):
+        if message.from_user is None:
+            return
         if not (admin_ids and message.from_user.id in admin_ids):
             await message.answer("Только администраторы могут создавать предприятия.")
             return
@@ -213,11 +248,16 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         company_id = await db.create_company(name, code)
         # Retrieve to show final code
         comp = await db.get_company(company_id)
-        await message.answer(f"Создано предприятие #{company_id}: {comp['name']}\nКод приглашения: {comp['invite_code']}")
+        if not comp:
+            await message.answer(f"Создано предприятие #{company_id}.")
+        else:
+            await message.answer(f"Создано предприятие #{company_id}: {comp['name']}\nКод приглашения: {comp['invite_code']}")
 
     # Admin: list companies
     @dp.message(Command("company_list"))
     async def company_list(message: Message):
+        if message.from_user is None:
+            return
         if not (admin_ids and message.from_user.id in admin_ids):
             await message.answer("Доступно только администраторам.")
             return
@@ -243,6 +283,8 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         if not comp:
             await message.answer("Неверный код предприятия. Проверьте и попробуйте снова.")
             return
+        if message.from_user is None:
+            return
         await db.set_user_company(message.from_user.id, comp["id"])
         await message.answer(f"Успешно привязано предприятие: {comp['name']} (#{comp['id']}).")
         await message.answer("Теперь можете создать заявку: нажмите '🆕 Новая заявка'.", reply_markup=main_menu())
@@ -252,7 +294,8 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     async def company_enter_code_cb(cb: CallbackQuery, state: FSMContext):
         await cb.answer()
         await state.set_state(CompanyStates.entering_code)
-        await cb.message.answer("Введите код предприятия (получите у администратора):")
+        if cb.message:
+            await cb.message.answer("Введите код предприятия (получите у администратора):")
 
     @dp.message(CompanyStates.entering_code)
     async def company_enter_code_message(message: Message, state: FSMContext):
@@ -264,6 +307,8 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         if not comp:
             await message.answer("Неверный код. Проверьте и попробуйте снова.")
             return
+        if message.from_user is None:
+            return
         await db.set_user_company(message.from_user.id, comp["id"])
         await state.clear()
         await message.answer(f"Привязано предприятие: {comp['name']} (#{comp['id']}).", reply_markup=main_menu())
@@ -271,6 +316,8 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     # New issue entrypoint via menu
     @dp.message(F.text == "🆕 Новая заявка")
     async def menu_new_issue(message: Message, state: FSMContext):
+        if message.from_user is None:
+            return
         company = await db.get_user_company(message.from_user.id)
         if not company:
             await message.answer("Сначала привяжите предприятие: /company_join <код>.", reply_markup=enter_company_code_kb())
@@ -282,17 +329,23 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     @dp.callback_query(F.data == "new_issue")
     async def cb_new_issue(cb: CallbackQuery, state: FSMContext):
         await cb.answer()
+        if cb.from_user is None:
+            return
         company = await db.get_user_company(cb.from_user.id)
         if not company:
-            await cb.message.answer("Сначала привяжите предприятие: /company_join <код>.", reply_markup=enter_company_code_kb())
+            if cb.message:
+                await cb.message.answer("Сначала привяжите предприятие: /company_join <код>.", reply_markup=enter_company_code_kb())
             return
         await state.set_state(ReportStates.choosing_category)
-        await cb.message.answer("Выберите категорию:", reply_markup=categories_inline_kb())
+        if cb.message:
+            await cb.message.answer("Выберите категорию:", reply_markup=categories_inline_kb())
 
     # My issues
     @dp.message(Command("my"))
     @dp.message(F.text == "📋 Мои заявки")
     async def my_issues(message: Message):
+        if message.from_user is None:
+            return
         rows = await db.user_issues(message.from_user.id, limit=5)
         if not rows:
             await message.answer("У вас пока нет заявок.")
@@ -323,6 +376,8 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     # Utility: get chat id and user id for configuration
     @dp.message(Command("chatid"))
     async def cmd_chatid(message: Message):
+        if message.from_user is None:
+            return
         await message.answer(
             f"Тип чата: {message.chat.type}\n"
             f"Chat ID: {message.chat.id}\n"
@@ -332,6 +387,9 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     # Staff: claim
     @dp.callback_query(F.data.startswith("claim:"))
     async def cb_claim(cb: CallbackQuery):
+        if not cb.data:
+            await cb.answer()
+            return
         issue_id = int(cb.data.split(":", 1)[1])
         issue = await db.get_issue(issue_id)
         if not issue:
@@ -339,6 +397,8 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             return
         if issue["status"] != "open":
             await cb.answer("Заявка уже взята кем-то другим", show_alert=True)
+            return
+        if cb.from_user is None:
             return
         ok = await db.claim_issue(issue_id, cb.from_user.id, display_from(cb))
         if not ok:
@@ -348,26 +408,34 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         comp = await db.get_company(issue["company_id"]) if issue["company_id"] else None
         text = staff_message_text(issue, override_assignee=display_from(cb), override_status="assigned", company_name=(comp["name"] if comp else None))
         try:
-            await cb.message.edit_text(text, reply_markup=staff_task_kb(issue_id, assigned_to=display_from(cb)))
+            if isinstance(cb.message, Message):
+                await cb.message.edit_text(text, reply_markup=staff_task_kb(issue_id, assigned_to=display_from(cb)))
+            else:
+                raise Exception("Inaccessible message")
         except Exception:
             # message might be not editable; send a follow-up
-            await cb.message.answer(text, reply_markup=staff_task_kb(issue_id, assigned_to=display_from(cb)))
+            if cb.message:
+                await cb.message.answer(text, reply_markup=staff_task_kb(issue_id, assigned_to=display_from(cb)))
         await cb.answer("Вы назначены ответственным")
 
     # Staff: complete flow start
     @dp.callback_query(F.data.startswith("complete:"))
     async def cb_complete(cb: CallbackQuery, state: FSMContext):
+        if not cb.data:
+            await cb.answer()
+            return
         issue_id = int(cb.data.split(":", 1)[1])
         issue = await db.get_issue(issue_id)
         if not issue:
             await cb.answer("Заявка не найдена", show_alert=True)
             return
-        if issue["assignee_user_id"] != cb.from_user.id:
+        if cb.from_user is None or issue["assignee_user_id"] != cb.from_user.id:
             await cb.answer("Только ответственный может завершить.", show_alert=True)
             return
         await state.update_data(complete_issue_id=issue_id, completion_text="", completion_photos=[])
         await state.set_state(CompleteStates.waiting_text)
-        await cb.message.answer(f"Завершение заявки #{issue_id}. Пришлите текстовый комментарий (или '-' чтобы пропустить).")
+        if cb.message:
+            await cb.message.answer(f"Завершение заявки #{issue_id}. Пришлите текстовый комментарий (или '-' чтобы пропустить).")
         await cb.answer()
 
     @dp.message(CompleteStates.waiting_text)
@@ -383,6 +451,8 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     async def completion_collect_photos(message: Message, state: FSMContext):
         data = await state.get_data()
         photos: List[str] = data.get("completion_photos", [])
+        if not message.photo:
+            return
         photos.append(message.photo[-1].file_id)
         await state.update_data(completion_photos=photos)
         await message.answer(f"Добавлено фото. Всего: {len(photos)}")
@@ -391,16 +461,25 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     async def send_completion(cb: CallbackQuery, state: FSMContext):
         await cb.answer()
         data = await state.get_data()
-        issue_id: int = data.get("complete_issue_id")
+        issue_id_val = data.get("complete_issue_id")
+        if not isinstance(issue_id_val, int):
+            if cb.message:
+                await cb.message.answer("Произошла ошибка: не удалось определить номер заявки.")
+            await state.clear()
+            return
+        issue_id: int = issue_id_val
         text: str = data.get("completion_text", "")
         photos: List[str] = data.get("completion_photos", [])
 
         issue = await db.get_issue(issue_id)
         if not issue:
-            await cb.message.answer("Заявка не найдена")
+            if cb.message:
+                await cb.message.answer("Заявка не найдена")
             await state.clear()
             return
         # Store completion photos
+        if cb.from_user is None:
+            return
         for fid in photos:
             await db.add_issue_photo(issue_id, fid, is_completion=True, uploader_user_id=cb.from_user.id)
         await db.complete_issue(issue_id)
@@ -417,7 +496,7 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
                 await bot.send_photo(tenant_chat_id, photos[0], caption=f"Фотоотчёт по заявке #{issue_id}")
             else:
                 media = [InputMediaPhoto(media=fid) for fid in photos[:10]]
-                await bot.send_media_group(tenant_chat_id, media)
+                await bot.send_media_group(tenant_chat_id, cast(List[MediaUnion], media))
                 await bot.send_message(tenant_chat_id, f"Фотоотчёт по заявке #{issue_id}")
 
         # Update staff message
@@ -433,7 +512,8 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         except Exception:
             pass
 
-        await cb.message.answer(f"Заявка #{issue_id} отмечена как выполненная.", reply_markup=main_menu())
+        if cb.message:
+            await cb.message.answer(f"Заявка #{issue_id} отмечена как выполненная.", reply_markup=main_menu())
         await state.clear()
 
     # Inline cancel for any active flow
@@ -441,21 +521,24 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     async def cancel_flow(cb: CallbackQuery, state: FSMContext):
         await state.clear()
         await cb.answer()
-        await cb.message.answer("Действие отменено.", reply_markup=main_menu())
+        if cb.message:
+            await cb.message.answer("Действие отменено.", reply_markup=main_menu())
 
     # Back: from description to categories
     @dp.callback_query(F.data == "back_to_categories")
     async def back_to_categories(cb: CallbackQuery, state: FSMContext):
         await cb.answer()
         await state.set_state(ReportStates.choosing_category)
-        await cb.message.answer("Выберите категорию:", reply_markup=categories_inline_kb())
+        if cb.message:
+            await cb.message.answer("Выберите категорию:", reply_markup=categories_inline_kb())
 
     # Back: from photos to description
     @dp.callback_query(F.data == "back_to_description")
     async def back_to_description(cb: CallbackQuery, state: FSMContext):
         await cb.answer()
         await state.set_state(ReportStates.typing_description)
-        await cb.message.answer("Опишите проблему текстом (что случилось, где именно).", reply_markup=description_nav_kb())
+        if cb.message:
+            await cb.message.answer("Опишите проблему текстом (что случилось, где именно).", reply_markup=description_nav_kb())
 
     # Fallback help
     @dp.message(Command("help"))
