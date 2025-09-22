@@ -1,11 +1,11 @@
-**TenantBot (Telegram)**
+# TenantBot (Telegram)
 
 - Purpose: Tenants report issues (plumbing, electricity, documents, other) via bot. Reports are saved to DB and sent to a staff chat. A repair person can claim a task once, attach completion photos, and mark it done. The tenant receives an automatic resolution notification.
 
-**Features**
+## Features
 
 - Polished UX with emoji menus and clear steps.
-- Categories via inline buttons: 🔧 Сантехника, 💡 Свет, 📄 Документы, ❓ Другая.
+- Categories via inline buttons: 🔧 Plumbing, 💡 Electricity, 📄 Documents, ❓ Other.
 - Text + multiple photos from tenant.
 - Enterprises (companies) with invite codes; users bind to a company.
 - Staff group receives task with inline buttons.
@@ -14,7 +14,33 @@
 - Tenant gets a resolution notification with photos.
 - SQLite storage; easy to deploy.
 
-**Setup**
+## How to run locally
+
+1. Install Python 3.10+.
+
+2. Create and activate a virtual environment:
+   ```bash
+   python -m venv .venv
+   source .venv/bin/activate   # Windows: .venv\Scripts\activate ---
+   ```
+
+3. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. Copy the example environment file and fill in variables:
+   ```bash
+   cp .env.example .env
+   # Set TELEGRAM_BOT_TOKEN and optionally STAFF_CHAT_ID
+   ```
+
+5. Run the bot:
+   ```bash
+   python -m app.main
+   ```
+
+## Setup (original)
 
 - Python 3.10+
 - Create a bot with @BotFather and obtain `TELEGRAM_BOT_TOKEN`.
@@ -22,7 +48,7 @@
 
 1) Install deps
 
-```
+```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -30,7 +56,7 @@ pip install -r requirements.txt
 
 2) Configure env
 
-```
+```bash
 cp .env.example .env
 # fill TELEGRAM_BOT_TOKEN
 # optionally set STAFF_CHAT_ID or use /setstaffchat in the staff group
@@ -38,15 +64,15 @@ cp .env.example .env
 
 3) Run
 
-```
+```bash
 python -m app.main
 ```
 
-**Docker + Backups**
+## Docker + Backups
 
 - Build and start with backups:
 
-```
+```bash
 cp .env.example .env
 # Fill TELEGRAM_BOT_TOKEN (and optionally STAFF_CHAT_ID, ADMIN_USER_IDS)
 docker compose up -d --build
@@ -63,7 +89,7 @@ docker compose up -d --build
 
 - Restore from a backup:
 
-```
+```bash
 # Stop bot
 docker compose stop bot
 
@@ -74,28 +100,27 @@ cp ./backups/bot-YYYYMMDDTHHMMSSZ.db ./data/bot.db
 docker compose start bot
 ```
 
-
-**How to set staff chat**
+## How to set staff chat
 
 - Option A: set `STAFF_CHAT_ID` in `.env`.
 - Option B: invite the bot to the staff group and run `/setstaffchat` in that group. Only users in `ADMIN_USER_IDS` can set it.
 
 You can use `/chatid` anywhere to get the current Chat ID and your User ID (useful to populate `STAFF_CHAT_ID` and `ADMIN_USER_IDS`).
 
-**Enterprises (companies)**
+## Enterprises (companies)
 
 - Admins:
   - `/company_create <name> [code]` — create a company and get its invite code.
   - `/company_list` — list companies and member counts.
 - Tenants:
-  - `/company_join <code>` — bind to a company by invite code, or use menu “🔑 Привязать предприятие”.
-- After binding, create issues via “🆕 Новая заявка”.
+  - `/company_join <code>` — bind to a company by invite code, or use menu “🔑 Bind enterprise”.
+- After binding, create issues via “🆕 New request”.
 
 Notes:
 - A user is linked to one company (rebinding overwrites previous).
 - All issues include company and show its name in staff notifications.
 
-**Data model (SQLite)**
+## Data model (SQLite)
 
 - companies: id, name, invite_code, created_at.
 - user_companies: user_id, company_id, created_at.
@@ -103,7 +128,7 @@ Notes:
 - issue_photos: id, issue_id, file_id, is_completion, uploader_user_id, created_at.
 - settings: key, value (stores staff_chat_id if set via command).
 
-**Notes**
+## Notes
 
 - The bot enforces that only the assignee can complete a task.
 - Buttons disable/adjust after claim/complete.
