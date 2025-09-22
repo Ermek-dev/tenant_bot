@@ -1,0 +1,25 @@
+# Global owner for all files in the repository
+* @iowathe3rd
+
+# Python application code
+/app/ @iowathe3rd
+
+# Data and backup directories
+/data/ @iowathe3rd
+/backup/ @iowathe3rd
+
+# Documentation
+/README.md @iowathe3rd
+
+# Python dependencies and virtual environment
+/requirements.txt @iowathe3rd
+/.venv/ @iowathe3rd
+
+# Docker configuration
+/Dockerfile @iowathe3rd
+/docker-compose.yml @iowathe3rd
+/.dockerignore @iowathe3rd
+
+# Git and environment configuration
+/.gitignore @iowathe3rd
+/.env @iowathe3rd
