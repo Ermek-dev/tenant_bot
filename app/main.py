@@ -95,35 +95,52 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     
 
     # Staff: set staff chat id
-    @dp.message(ReportStates.creating_report, F.content_type == ContentType.PHOTO)
-    async def creating_report_photo(message: Message, state: FSMContext):
+    @dp.message(ReportStates.creating_report, F.content_type.in_({ContentType.PHOTO, ContentType.TEXT}))
+    async def creating_report_input(message: Message, state: FSMContext):
         data = await state.get_data()
-        photos: list[str] = data.get("photos", [])
-        description = data.get("description")
+        photos: list[str] = list(data.get("photos", []))
+        existing_description = (data.get("description") or "").strip()
 
+        added_photos = False
         if message.photo:
-            file_id = message.photo[-1].file_id  
+            file_id = message.photo[-1].file_id
             photos.append(file_id)
+            added_photos = True
 
-        if not description:
-            cap = (message.caption or "").strip()
-            if cap:
-                description = cap
+        incoming_description = (message.caption or message.text or "").strip()
+        description_changed = False
+        description = existing_description
+        if incoming_description:
+            description_changed = incoming_description != existing_description
+            description = incoming_description
+
+        if not added_photos and not incoming_description:
+            await message.answer("Не удалось распознать сообщение. Пришлите текстовое описание или фото с подписью.")
+            return
 
         await state.update_data(photos=photos, description=description)
-        await message.answer(
-            f"Фото добавлено. Всего: {len(photos)}. "
-            f"{'Описание принято.' if description else 'Добавьте описание (подпись к фото) или пришлите текст сообщением.'}"
-        )
 
-    @dp.message(ReportStates.creating_report, F.content_type == ContentType.TEXT)
-    async def creating_report_text(message: Message, state: FSMContext):
-        desc = (message.text or "").strip()
-        if not desc:
-            await message.answer("Пустое описание. Пришлите текст или фото с подписью.")
-            return
-        await state.update_data(description=desc)
-        await message.answer("Описание принято. Можете добавить фото или нажмите «✅ Отправить».")
+        description_present = bool(description)
+        has_photos = len(photos) > 0
+
+        response_parts: list[str] = []
+        if added_photos:
+            response_parts.append(f"Фото добавлено. Всего: {len(photos)}.")
+
+        if description_changed:
+            if existing_description:
+                response_parts.append("Описание обновлено.")
+            else:
+                response_parts.append("Описание принято.")
+
+        if not description_present:
+            response_parts.append("Добавьте описание (подпись к фото) или пришлите текст сообщением.")
+        elif not has_photos:
+            response_parts.append("Можете добавить фото или нажмите «✅ Отправить».")
+        else:
+            response_parts.append("Когда будете готовы — нажмите «✅ Отправить».")
+
+        await message.answer(" ".join(response_parts))
         
     @dp.callback_query(F.data.startswith("cat:"))
     async def choose_category_inline(cb: CallbackQuery, state: FSMContext):
