@@ -80,3 +80,31 @@ def description_nav_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⬅️ Назад к категориям", callback_data="back_to_categories")],
         [InlineKeyboardButton(text="⛔️ Отмена", callback_data="cancel_flow")],
     ])
+
+
+def cancel_company_create_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⛔️ Отменить создание", callback_data="cancel_company_create")],
+    ])
+
+
+def deadline_choice_kb(issue_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏰ В течение часа", callback_data=f"deadline:{issue_id}:1hour")],
+        [InlineKeyboardButton(text="📅 В течение дня", callback_data=f"deadline:{issue_id}:1day")],
+        [InlineKeyboardButton(text="✏️ Указать срок", callback_data=f"deadline:{issue_id}:custom")],
+        [InlineKeyboardButton(text="⛔️ Отмена", callback_data=f"cancel_claim:{issue_id}")],
+    ])
+
+
+def send_issue_kb() -> InlineKeyboardMarkup:
+    """Упрощённая клавиатура для отправки заявки."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Отправить заявку", callback_data="send_issue"),
+        ],
+        [
+            InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_categories"),
+            InlineKeyboardButton(text="⛔️ Отмена", callback_data="cancel_flow"),
+        ],
+    ])
