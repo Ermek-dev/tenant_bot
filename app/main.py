@@ -5,12 +5,13 @@ from typing import List, Optional, cast
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (CallbackQuery, ContentType, InlineKeyboardMarkup,
-                           InputMediaPhoto, Message, MediaUnion)
+                           InputMediaPhoto, Message, MediaUnion, BotCommand,
+                           BotCommandScopeDefault, BotCommandScopeChat)
 from aiogram.fsm.context import FSMContext
 
 from app.config import load_settings
 from app import db
-from app.states import ReportStates, CompleteStates, CompanyStates
+from app.states import ReportStates, CompleteStates, CompanyStates, ClaimStates
 from app.keyboards import (
     main_menu,
     skip_or_done_kb,
@@ -21,6 +22,8 @@ from app.keyboards import (
     enter_company_code_kb,
     quick_start_kb,
     description_nav_kb,
+    deadline_choice_kb,
+    send_issue_kb,
 )
 from app.utils import user_display_name
 
@@ -41,8 +44,49 @@ async def on_startup() -> tuple[Bot, Dispatcher, int | None]:
     bot = Bot(token=settings.bot_token)
     dp = Dispatcher()
 
+    # Set up command menu (кнопка "/")
+    await setup_bot_commands(bot, admin_ids=settings.admin_user_ids)
+    
     register_handlers(dp, bot, admin_ids=settings.admin_user_ids)
     return bot, dp, staff_chat_id
+
+
+async def setup_bot_commands(bot: Bot, admin_ids: set[int]):
+    """Настройка меню команд бота (кнопка '/')."""
+    try:
+        commands = [
+            BotCommand(command="start", description="Главное меню"),
+            BotCommand(command="my", description="Мои заявки"),
+            BotCommand(command="help", description="Справка"),
+            BotCommand(command="company_join", description="Привязать предприятие"),
+            BotCommand(command="cancel", description="Отменить действие"),
+            BotCommand(command="chatid", description="Показать ID чата"),
+        ]
+        
+        # Устанавливаем команды для всех пользователей (по умолчанию)
+        await bot.set_my_commands(commands)
+        
+        # Для администраторов добавляем дополнительные команды
+        if admin_ids:
+            admin_commands = commands + [
+                BotCommand(command="company_create", description="Создать предприятие (админ)"),
+                BotCommand(command="company_list", description="Список предприятий (админ)"),
+                BotCommand(command="setstaffchat", description="Установить группу (админ)"),
+            ]
+            
+            # Устанавливаем расширенный список для каждого администратора
+            for admin_id in admin_ids:
+                try:
+                    await bot.set_my_commands(
+                        admin_commands, 
+                        scope=BotCommandScopeChat(chat_id=admin_id)
+                    )
+                except Exception:
+                    # Игнорируем ошибки для пользователей, которые ещё не писали боту
+                    pass
+    except Exception as e:
+        # Логируем ошибку, но не прерываем работу бота
+        print(f"Ошибка при установке команд меню: {e}")
 
 
 def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
@@ -84,81 +128,108 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
 
         await state.update_data(category=mapping[text], photos=[], description=None)
         await message.answer(
-            "Отправьте фото(а) с подписью — это и будет описание.\n"
-            "Можно без фото — пришлите текст одним сообщением.\n"
-            "Когда будете готовы — нажмите «✅ Отправить».",
-            reply_markup=skip_or_done_kb(),
+            "📝 Опишите проблему:\n"
+            "• Отправьте фото с подписью\n"
+            "• Или просто текст",
+            reply_markup=description_nav_kb(),
         )
         await state.set_state(ReportStates.creating_report)
 
 
     
 
-    # Staff: set staff chat id
+    # Simplified report creation - automatic preview with send button
     @dp.message(ReportStates.creating_report, F.content_type.in_({ContentType.PHOTO, ContentType.TEXT}))
     async def creating_report_input(message: Message, state: FSMContext):
         data = await state.get_data()
         photos: list[str] = list(data.get("photos", []))
         existing_description = (data.get("description") or "").strip()
 
-        added_photos = False
+        # Add photo if present
         if message.photo:
             file_id = message.photo[-1].file_id
             photos.append(file_id)
-            added_photos = True
 
+        # Get description from caption or text
         incoming_description = (message.caption or message.text or "").strip()
-        description_changed = False
-        description = existing_description
-        if incoming_description:
-            description_changed = incoming_description != existing_description
-            description = incoming_description
+        description = incoming_description if incoming_description else existing_description
 
-        if not added_photos and not incoming_description:
-            await message.answer("Не удалось распознать сообщение. Пришлите текстовое описание или фото с подписью.")
+        if not description and not photos:
+            await message.answer("❌ Не удалось распознать сообщение. Пришлите текст или фото с подписью.")
             return
 
+        # Update state
         await state.update_data(photos=photos, description=description)
 
-        description_present = bool(description)
-        has_photos = len(photos) > 0
-
-        response_parts: list[str] = []
-        if added_photos:
-            response_parts.append(f"Фото добавлено. Всего: {len(photos)}.")
-
-        if description_changed:
-            if existing_description:
-                response_parts.append("Описание обновлено.")
-            else:
-                response_parts.append("Описание принято.")
-
-        if not description_present:
-            response_parts.append("Добавьте описание (подпись к фото) или пришлите текст сообщением.")
-        elif not has_photos:
-            response_parts.append("Можете добавить фото или нажмите «✅ Отправить».")
+        # Show preview and send button if we have description
+        if description:
+            category = data.get("category")
+            category_name = human_category(category) if category else "Неизвестная"
+            
+            # Show preview if this is new description or first time
+            was_empty = not existing_description
+            if was_empty or incoming_description:
+                preview_text = (
+                    f"📋 <b>Превью заявки</b>\n\n"
+                    f"Категория: {category_name}\n"
+                    f"Описание: {description[:100]}{'...' if len(description) > 100 else ''}\n"
+                    f"Фото: {len(photos)} шт.\n\n"
+                    f"✅ Готово к отправке!"
+                )
+                await message.answer(preview_text, parse_mode="HTML", reply_markup=send_issue_kb())
+            elif message.photo:
+                # Just adding more photos, minimal feedback
+                await message.answer(f"✅ Фото добавлено. Всего: {len(photos)} шт. Используйте кнопку выше для отправки.")
+        elif photos:
+            # Only photos, no description yet
+            await message.answer(
+                f"✅ Фото добавлено ({len(photos)} шт.)\n"
+                f"Добавьте описание (подпись к фото или отправьте текстом):",
+                reply_markup=description_nav_kb()
+            )
         else:
-            response_parts.append("Когда будете готовы — нажмите «✅ Отправить».")
-
-        await message.answer(" ".join(response_parts))
+            await message.answer("❌ Не удалось распознать сообщение. Пришлите текст или фото с подписью.")
         
     @dp.callback_query(F.data.startswith("cat:"))
     async def choose_category_inline(cb: CallbackQuery, state: FSMContext):
-        await cb.answer()
         if not cb.data:
+            await cb.answer()
             return
         code = cb.data.split(":", 1)[1]
+        category_name = human_category(code)
+        
+        # Скрываем кнопки категорий - редактируем сообщение
+        if cb.message:
+            try:
+                await cb.message.edit_text(
+                    f"✅ Категория выбрана: <b>{category_name}</b>",
+                    parse_mode="HTML",
+                    reply_markup=None
+                )
+            except Exception:
+                # Если не удалось отредактировать, просто скрываем кнопки
+                try:
+                    await cb.message.edit_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+        
+        await cb.answer(f"Выбрано: {category_name}")
+        
         await state.update_data(category=code, photos=[], description=None)
         if cb.message:
             await cb.message.answer(
-                "Отправьте фото(а) с подписью — это и будет описание.\n"
-                "Можно без фото — пришлите текст одним сообщением.\n"
-                "Когда будете готовы — нажмите «✅ Отправить».",
-                reply_markup=skip_or_done_kb(),
+                f"📝 Опишите проблему:\n"
+                f"• Отправьте фото с подписью\n"
+                f"• Или просто текст",
+                reply_markup=description_nav_kb(),
             )
         await state.set_state(ReportStates.creating_report)
 
         
+    @dp.callback_query(ReportStates.creating_report, F.data == "send_issue")
+    async def send_issue_callback(cb: CallbackQuery, state: FSMContext):
+        await finalize_report(cb, state)
+    
     @dp.callback_query(ReportStates.creating_report, F.data.in_({"skip_photos", "done_photos"}))
     async def finalize_report(cb: CallbackQuery, state: FSMContext):
         await cb.answer()
@@ -256,63 +327,313 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         await db.set_setting("staff_chat_id", str(message.chat.id))
         await message.answer(f"Группа сотрудников зарегистрирована: {message.chat.id}")
 
-    # Admin: create company
+    # Admin: create company - improved with examples
     @dp.message(Command("company_create"))
-    async def company_create(message: Message):
+    async def company_create(message: Message, state: FSMContext):
         if message.from_user is None:
             return
         if not (admin_ids and message.from_user.id in admin_ids):
-            await message.answer("Только администраторы могут создавать предприятия.")
+            await message.answer("❌ Только администраторы могут создавать предприятия.")
             return
+        
+        # Parse arguments
         args = (message.text or "").split(maxsplit=2)
+        
+        # If no arguments, start interactive mode
         if len(args) < 2:
-            await message.answer("Использование: /company_create <название> [код]")
+            help_text = (
+                "🏢 <b>Создание предприятия</b>\n\n"
+                "Вы можете создать предприятие двумя способами:\n\n"
+                "<b>Способ 1: Быстрое создание</b>\n"
+                "Используйте команду с названием предприятия:\n"
+                "<code>/company_create ООО \"РТС ЛТД\"</code>\n\n"
+                "Или с названием и кодом приглашения:\n"
+                "<code>/company_create ООО \"РТС ЛТД\" RTS2024</code>\n\n"
+                "<b>Примеры:</b>\n"
+                "• <code>/company_create БАТ 1121</code>\n"
+                "• <code>/company_create Софарма</code> (код сгенерируется автоматически)\n"
+                "• <code>/company_create \"Мой бухгалтер\" 133</code>\n\n"
+                "<b>Способ 2: Интерактивный режим</b>\n"
+                "Отправьте команду <code>/company_create</code> без параметров,\n"
+                "и бот проведёт вас по шагам.\n\n"
+                "Начнём? Отправьте название предприятия:"
+            )
+            await message.answer(help_text, parse_mode="HTML")
+            await state.set_state(CompanyStates.creating_name)
             return
-        name = args[1]
-        code = args[2] if len(args) > 2 else None
-        company_id = await db.create_company(name, code)
-        # Retrieve to show final code
-        comp = await db.get_company(company_id)
-        if not comp:
-            await message.answer(f"Создано предприятие #{company_id}.")
-        else:
-            await message.answer(f"Создано предприятие #{company_id}: {comp['name']}\nКод приглашения: {comp['invite_code']}")
+        
+        # Quick creation mode
+        name = args[1].strip()
+        code = args[2].strip() if len(args) > 2 else None
+        
+        # Validate name
+        if not name or len(name) < 2:
+            await message.answer(
+                "❌ Название предприятия слишком короткое (минимум 2 символа).\n\n"
+                "<b>Пример:</b>\n"
+                "<code>/company_create ООО \"РТС ЛТД\"</code>",
+                parse_mode="HTML"
+            )
+            return
+        
+        # Check if code already exists
+        if code:
+            code = code.strip().upper()
+            existing = await db.get_company_by_invite(code)
+            if existing:
+                await message.answer(
+                    f"❌ Код приглашения <code>{code}</code> уже используется предприятием: {existing['name']}\n\n"
+                    f"Попробуйте другой код или создайте без кода (он сгенерируется автоматически).",
+                    parse_mode="HTML"
+                )
+                return
+        
+        # Create company
+        try:
+            company_id = await db.create_company(name, code)
+            comp = await db.get_company(company_id)
+            if comp:
+                await message.answer(
+                    f"✅ <b>Предприятие успешно создано!</b>\n\n"
+                    f"🏢 Название: {comp['name']}\n"
+                    f"🆔 ID: #{comp['id']}\n"
+                    f"🔑 Код приглашения: <code>{comp['invite_code']}</code>\n\n"
+                    f"Поделитесь этим кодом с арендаторами, чтобы они могли присоединиться.",
+                    parse_mode="HTML"
+                )
+            else:
+                await message.answer(f"✅ Создано предприятие #{company_id}: {name}")
+        except Exception as e:
+            await message.answer(
+                f"❌ Ошибка при создании предприятия: {str(e)}\n\n"
+                "Попробуйте ещё раз или используйте интерактивный режим."
+            )
+    
+    # Interactive company creation: name input
+    @dp.message(CompanyStates.creating_name)
+    async def company_create_name(message: Message, state: FSMContext):
+        name = (message.text or "").strip()
+        
+        if not name or len(name) < 2:
+            await message.answer(
+                "❌ Название предприятия слишком короткое (минимум 2 символа).\n"
+                "Пожалуйста, введите корректное название:"
+            )
+            return
+        
+        # Check if company with this name already exists
+        companies = await db.list_companies()
+        for comp in companies:
+            if comp['name'].lower() == name.lower():
+                await message.answer(
+                    f"⚠️ Предприятие с названием <b>\"{name}\"</b> уже существует!\n\n"
+                    f"ID: #{comp['id']}\n"
+                    f"Код: {comp['invite_code']}\n\n"
+                    "Введите другое название или отправьте /cancel для отмены.",
+                    parse_mode="HTML"
+                )
+                return
+        
+        await state.update_data(company_name=name)
+        await state.set_state(CompanyStates.creating_code)
+        await message.answer(
+            f"✅ Название принято: <b>{name}</b>\n\n"
+            f"Теперь введите код приглашения (или отправьте <code>-</code> для автоматической генерации):\n\n"
+            f"<b>Примеры кодов:</b>\n"
+            f"• <code>1121</code>\n"
+            f"• <code>RTS2024</code>\n"
+            f"• <code>ABC123</code>\n\n"
+            f"Отправьте <code>-</code> если хотите, чтобы код был сгенерирован автоматически.",
+            parse_mode="HTML"
+        )
+    
+    # Interactive company creation: code input
+    @dp.message(CompanyStates.creating_code)
+    async def company_create_code(message: Message, state: FSMContext):
+        code_input = (message.text or "").strip()
+        data = await state.get_data()
+        name = data.get("company_name")
+        
+        if not name:
+            await message.answer("❌ Ошибка: название не найдено. Начните заново: /company_create")
+            await state.clear()
+            return
+        
+        # Auto-generate code if user sent "-"
+        code = None
+        if code_input and code_input != "-":
+            code = code_input.strip().upper()
+            
+            # Validate code format
+            if len(code) < 2:
+                await message.answer(
+                    "❌ Код приглашения слишком короткий (минимум 2 символа).\n"
+                    "Введите код ещё раз или отправьте <code>-</code> для автоматической генерации:",
+                    parse_mode="HTML"
+                )
+                return
+            
+            # Check if code already exists
+            existing = await db.get_company_by_invite(code)
+            if existing:
+                await message.answer(
+                    f"❌ Код приглашения <code>{code}</code> уже используется предприятием: {existing['name']}\n\n"
+                    f"Введите другой код или отправьте <code>-</code> для автоматической генерации:",
+                    parse_mode="HTML"
+                )
+                return
+        
+        # Create company
+        try:
+            company_id = await db.create_company(name, code)
+            comp = await db.get_company(company_id)
+            await state.clear()
+            
+            if comp:
+                await message.answer(
+                    f"✅ <b>Предприятие успешно создано!</b>\n\n"
+                    f"🏢 Название: {comp['name']}\n"
+                    f"🆔 ID: #{comp['id']}\n"
+                    f"🔑 Код приглашения: <code>{comp['invite_code']}</code>\n\n"
+                    f"💡 <b>Поделитесь этим кодом с арендаторами:</b>\n"
+                    f"<code>/company_join {comp['invite_code']}</code>",
+                    parse_mode="HTML"
+                )
+        except Exception as e:
+            await message.answer(
+                f"❌ Ошибка при создании предприятия: {str(e)}\n\n"
+                "Попробуйте ещё раз: /company_create"
+            )
+            await state.clear()
 
-    # Admin: list companies
+    # Admin: list companies - improved formatting
     @dp.message(Command("company_list"))
     async def company_list(message: Message):
         if message.from_user is None:
             return
         if not (admin_ids and message.from_user.id in admin_ids):
-            await message.answer("Доступно только администраторам.")
+            await message.answer("❌ Доступно только администраторам.")
             return
+        
         comps = await db.list_companies()
         if not comps:
-            await message.answer("Список предприятий пуст.")
+            await message.answer(
+                "📋 <b>Список предприятий пуст</b>\n\n"
+                "Создайте первое предприятие командой:\n"
+                "<code>/company_create</code>",
+                parse_mode="HTML"
+            )
             return
+        
+        total_members = 0
         lines = []
+        
         for c in comps:
             cnt = await db.company_member_count(c["id"])
-            lines.append(f"#{c['id']} — {c['name']} (код: {c['invite_code'] or '—'}, пользователей: {cnt})")
-        await message.answer("Список предприятий:\n" + "\n".join(lines))
+            total_members += cnt
+            code_display = f"<code>{c['invite_code']}</code>" if c['invite_code'] else "—"
+            member_emoji = "👥" if cnt > 0 else "👤"
+            lines.append(
+                f"#{c['id']} <b>{c['name']}</b>\n"
+                f"   🔑 Код: {code_display} | {member_emoji} Пользователей: {cnt}"
+            )
+        
+        header = (
+            f"📋 <b>Список предприятий</b>\n\n"
+            f"Всего предприятий: <b>{len(comps)}</b>\n"
+            f"Всего пользователей: <b>{total_members}</b>\n\n"
+        )
+        
+        # Split into chunks if too long (Telegram limit ~4096 chars)
+        full_text = header + "\n\n".join(lines)
+        
+        if len(full_text) > 4000:
+            # Send in chunks
+            await message.answer(header, parse_mode="HTML")
+            current_chunk = []
+            current_length = 0
+            
+            for line in lines:
+                line_with_sep = line + "\n\n"
+                if current_length + len(line_with_sep) > 4000:
+                    await message.answer("\n\n".join(current_chunk), parse_mode="HTML")
+                    current_chunk = [line]
+                    current_length = len(line)
+                else:
+                    current_chunk.append(line)
+                    current_length += len(line_with_sep)
+            
+            if current_chunk:
+                await message.answer("\n\n".join(current_chunk), parse_mode="HTML")
+        else:
+            await message.answer(full_text, parse_mode="HTML")
 
-    # Tenant: join company by invite code
+    # Tenant: join company by invite code - improved
     @dp.message(Command("company_join"))
     async def company_join(message: Message):
         args = (message.text or "").split(maxsplit=1)
         if len(args) < 2:
-            await message.answer("Использование: /company_join <код>")
+            await message.answer(
+                "🔑 <b>Привязка к предприятию</b>\n\n"
+                "<b>Использование:</b>\n"
+                "<code>/company_join &lt;код&gt;</code>\n\n"
+                "<b>Примеры:</b>\n"
+                "• <code>/company_join 1121</code>\n"
+                "• <code>/company_join RTS2024</code>\n"
+                "• <code>/company_join ABC123</code>\n\n"
+                "💡 Получите код приглашения у администратора вашего предприятия.",
+                parse_mode="HTML"
+            )
             return
-        code = args[1].strip()
-        comp = await db.get_company_by_invite(code)
-        if not comp:
-            await message.answer("Неверный код предприятия. Проверьте и попробуйте снова.")
-            return
+        
+        code = args[1].strip().upper()
+        
         if message.from_user is None:
             return
+        
+        comp = await db.get_company_by_invite(code)
+        if not comp:
+            await message.answer(
+                f"❌ <b>Неверный код приглашения</b>\n\n"
+                f"Код <code>{code}</code> не найден в базе данных.\n\n"
+                f"💡 Проверьте код и попробуйте снова.\n"
+                f"Если код не работает, обратитесь к администратору вашего предприятия.",
+                parse_mode="HTML"
+            )
+            return
+        
+        # Check if already bound to this company
+        current_company = await db.get_user_company(message.from_user.id)
+        if current_company and current_company["id"] == comp["id"]:
+            await message.answer(
+                f"ℹ️ Вы уже привязаны к этому предприятию:\n"
+                f"<b>{comp['name']}</b> (#{comp['id']})\n\n"
+                f"Вы можете создать заявку через меню.",
+                parse_mode="HTML",
+                reply_markup=main_menu()
+            )
+            return
+        
         await db.set_user_company(message.from_user.id, comp["id"])
-        await message.answer(f"Успешно привязано предприятие: {comp['name']} (#{comp['id']}).")
-        await message.answer("Теперь можете создать заявку: нажмите '🆕 Новая заявка'.", reply_markup=main_menu())
+        
+        if current_company:
+            await message.answer(
+                f"✅ <b>Предприятие успешно изменено!</b>\n\n"
+                f"Было: {current_company['name']}\n"
+                f"Стало: <b>{comp['name']}</b> (#{comp['id']})\n\n"
+                f"Теперь вы можете создавать заявки от имени нового предприятия.",
+                parse_mode="HTML",
+                reply_markup=main_menu()
+            )
+        else:
+            await message.answer(
+                f"✅ <b>Предприятие успешно привязано!</b>\n\n"
+                f"🏢 <b>{comp['name']}</b>\n"
+                f"🆔 ID: #{comp['id']}\n\n"
+                f"Теперь вы можете создавать заявки. Нажмите кнопку ниже:",
+                parse_mode="HTML",
+                reply_markup=main_menu()
+            )
 
     # Tenant: enter company code via UI
     @dp.callback_query(F.data == "company:enter_code")
@@ -409,9 +730,9 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             f"Ваш User ID: {message.from_user.id}"
         )
 
-    # Staff: claim
+    # Staff: claim - show deadline selection
     @dp.callback_query(F.data.startswith("claim:"))
-    async def cb_claim(cb: CallbackQuery):
+    async def cb_claim(cb: CallbackQuery, state: FSMContext):
         if not cb.data:
             await cb.answer()
             return
@@ -425,23 +746,194 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             return
         if cb.from_user is None:
             return
-        ok = await db.claim_issue(issue_id, cb.from_user.id, display_from(cb))
-        if not ok:
-            await cb.answer("Не удалось взять заявку", show_alert=True)
+        
+        # Show deadline selection instead of claiming immediately
+        await state.update_data(claim_issue_id=issue_id, claim_assignee_user_id=cb.from_user.id, claim_assignee_name=display_from(cb))
+        if cb.message:
+            await cb.message.answer(
+                f"Выберите срок выполнения заявки #{issue_id}:",
+                reply_markup=deadline_choice_kb(issue_id)
+            )
+        await cb.answer()
+
+    # Staff: handle deadline selection
+    @dp.callback_query(F.data.startswith("deadline:"))
+    async def cb_deadline_choice(cb: CallbackQuery, state: FSMContext):
+        if not cb.data:
+            await cb.answer()
             return
-        # edit staff message to show assignee and change buttons
-        comp = await db.get_company(issue["company_id"]) if issue["company_id"] else None
-        text = staff_message_text(issue, override_assignee=display_from(cb), override_status="assigned", company_name=(comp["name"] if comp else None))
-        try:
-            if isinstance(cb.message, Message):
-                await cb.message.edit_text(text, reply_markup=staff_task_kb(issue_id, assigned_to=display_from(cb)))
-            else:
-                raise Exception("Inaccessible message")
-        except Exception:
-            # message might be not editable; send a follow-up
+        
+        # Parse: deadline:issue_id:choice
+        parts = cb.data.split(":")
+        if len(parts) < 3:
+            await cb.answer("Ошибка данных", show_alert=True)
+            return
+        
+        issue_id = int(parts[1])
+        choice = parts[2]
+        
+        data = await state.get_data()
+        stored_issue_id = data.get("claim_issue_id")
+        
+        if stored_issue_id != issue_id:
+            await cb.answer("Ошибка: несоответствие данных", show_alert=True)
+            await state.clear()
+            return
+        
+        issue = await db.get_issue(issue_id)
+        if not issue:
+            await cb.answer("Заявка не найдена", show_alert=True)
+            await state.clear()
+            return
+        
+        if issue["status"] != "open":
+            await cb.answer("Заявка уже взята кем-то другим", show_alert=True)
+            await state.clear()
+            return
+        
+        assignee_user_id = data.get("claim_assignee_user_id")
+        assignee_name = data.get("claim_assignee_name")
+        
+        if not assignee_user_id or not assignee_name:
+            await cb.answer("Ошибка: данные исполнителя не найдены", show_alert=True)
+            await state.clear()
+            return
+        
+        deadline_text = ""
+        deadline_iso = None
+        
+        from datetime import datetime, timedelta, timezone
+        
+        if choice == "1hour":
+            deadline_text = "в течение часа"
+            deadline_iso = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        elif choice == "1day":
+            deadline_text = "в течение дня"
+            deadline_iso = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        elif choice == "custom":
+            await state.set_state(ClaimStates.entering_custom_deadline)
             if cb.message:
-                await cb.message.answer(text, reply_markup=staff_task_kb(issue_id, assigned_to=display_from(cb)))
-        await cb.answer("Вы назначены ответственным")
+                await cb.message.answer(
+                    "Введите срок выполнения заявки текстом (например: 'в течение 2 часов', 'до конца недели', 'завтра до 18:00'):"
+                )
+            await cb.answer()
+            return
+        
+        # Claim with deadline
+        if deadline_iso:
+            ok = await db.claim_issue(issue_id, assignee_user_id, assignee_name, deadline_iso)
+            if not ok:
+                await cb.answer("Не удалось взять заявку", show_alert=True)
+                await state.clear()
+                return
+            
+            # Notify tenant about deadline
+            tenant_chat_id = issue["tenant_chat_id"]
+            try:
+                await bot.send_message(
+                    tenant_chat_id,
+                    f"✅ Ваша заявка #{issue_id} взята в работу.\n"
+                    f"📅 Срок выполнения: {deadline_text}\n"
+                    f"👤 Ответственный: {assignee_name}"
+                )
+            except Exception:
+                pass  # Ignore errors when sending notification
+            
+            # Update staff message
+            comp = await db.get_company(issue["company_id"]) if issue["company_id"] else None
+            updated_issue = await db.get_issue(issue_id)
+            text = staff_message_text(updated_issue, company_name=(comp["name"] if comp else None))
+            
+            try:
+                if isinstance(cb.message, Message):
+                    await cb.message.edit_text(text, reply_markup=staff_task_kb(issue_id, assigned_to=assignee_name))
+                else:
+                    raise Exception("Inaccessible message")
+            except Exception:
+                if cb.message:
+                    await cb.message.answer(text, reply_markup=staff_task_kb(issue_id, assigned_to=assignee_name))
+            
+            await cb.answer(f"Заявка взята в работу. Срок: {deadline_text}")
+            await state.clear()
+
+    # Staff: handle custom deadline text input
+    @dp.message(ClaimStates.entering_custom_deadline)
+    async def cb_custom_deadline_text(message: Message, state: FSMContext):
+        custom_deadline_text = (message.text or "").strip()
+        if not custom_deadline_text:
+            await message.answer("Пожалуйста, введите срок выполнения:")
+            return
+        
+        data = await state.get_data()
+        issue_id = data.get("claim_issue_id")
+        assignee_user_id = data.get("claim_assignee_user_id")
+        assignee_name = data.get("claim_assignee_name")
+        
+        if not issue_id or not assignee_user_id or not assignee_name:
+            await message.answer("Ошибка: данные не найдены. Попробуйте взять заявку заново.")
+            await state.clear()
+            return
+        
+        issue = await db.get_issue(issue_id)
+        if not issue:
+            await message.answer("Заявка не найдена")
+            await state.clear()
+            return
+        
+        if issue["status"] != "open":
+            await message.answer("Заявка уже взята кем-то другим")
+            await state.clear()
+            return
+        
+        # Claim with custom deadline (store text in deadline field)
+        ok = await db.claim_issue(issue_id, assignee_user_id, assignee_name, custom_deadline_text)
+        if not ok:
+            await message.answer("Не удалось взять заявку. Попробуйте ещё раз.")
+            await state.clear()
+            return
+        
+        # Notify tenant about deadline
+        tenant_chat_id = issue["tenant_chat_id"]
+        try:
+            await bot.send_message(
+                tenant_chat_id,
+                f"✅ Ваша заявка #{issue_id} взята в работу.\n"
+                f"📅 Срок выполнения: {custom_deadline_text}\n"
+                f"👤 Ответственный: {assignee_name}"
+            )
+        except Exception:
+            pass  # Ignore errors when sending notification
+        
+        # Update staff message
+        comp = await db.get_company(issue["company_id"]) if issue["company_id"] else None
+        updated_issue = await db.get_issue(issue_id)
+        text = staff_message_text(updated_issue, company_name=(comp["name"] if comp else None))
+        
+        try:
+            # Try to edit original message if possible
+            staff_chat_id = issue.get("staff_chat_id")
+            staff_message_id = issue.get("staff_message_id")
+            if staff_chat_id and staff_message_id:
+                await bot.edit_message_text(
+                    chat_id=staff_chat_id,
+                    message_id=staff_message_id,
+                    text=text,
+                    reply_markup=staff_task_kb(issue_id, assigned_to=assignee_name)
+                )
+        except Exception:
+            # If edit fails, send new message
+            await message.answer(text, reply_markup=staff_task_kb(issue_id, assigned_to=assignee_name))
+        
+        await message.answer(f"✅ Заявка #{issue_id} взята в работу. Срок: {custom_deadline_text}")
+        await state.clear()
+
+    # Cancel claim
+    @dp.callback_query(F.data.startswith("cancel_claim:"))
+    async def cb_cancel_claim(cb: CallbackQuery, state: FSMContext):
+        await state.clear()
+        await cb.answer("Выбор срока отменён")
+        if cb.message:
+            await cb.message.answer("Действие отменено.")
 
     # Staff: complete flow start
     @dp.callback_query(F.data.startswith("complete:"))
@@ -570,18 +1062,37 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             )
 
 
-    # Fallback help
+    # Help command - короткая информативная версия
     @dp.message(Command("help"))
     async def cmd_help(message: Message):
-        await message.answer(
+        if message.from_user is None:
+            return
+        
+        is_admin = admin_ids and message.from_user.id in admin_ids
+        
+        help_text = (
+            "📚 <b>Справка по командам</b>\n\n"
+            "<b>Основные команды:</b>\n"
             "/start — главное меню\n"
             "/my — мои последние заявки\n"
+            "/company_join &lt;код&gt; — привязать предприятие\n"
             "/chatid — показать chat id и ваш user id\n"
-            "/setstaffchat — установить группу сотрудников (выполнить в группе)\n"
-            "/company_create — создать предприятие (админ)\n"
-            "/company_list — список предприятий (админ)\n"
-            "/company_join <код> — привязать предприятие"
+            "/cancel — отменить текущее действие\n"
         )
+        
+        if is_admin:
+            help_text += (
+                "\n<b>Команды администратора:</b>\n"
+                "/company_create &lt;название&gt; [код] — создать предприятие\n"
+                "/company_list — список предприятий\n"
+                "/setstaffchat — установить группу сотрудников (выполнить в группе)\n"
+            )
+        
+        help_text += (
+            "\n💡 <b>Совет:</b> Используйте кнопку '/' для быстрого доступа к командам!"
+        )
+        
+        await message.answer(help_text, parse_mode="HTML")
 
     # Ignore other photos outside states to avoid confusion
     @dp.message(F.content_type == ContentType.PHOTO)
@@ -596,13 +1107,18 @@ def display_from(cb: CallbackQuery) -> str:
 
 
 def human_category(code: str) -> str:
-    mapping = {code: title for title, code in CATEGORIES}
-    return mapping.get(code, code)
+    """Преобразует код категории в человекочитаемое название."""
+    for title, cat_code in CATEGORIES:
+        if cat_code == code:
+            return title
+    return code
 
 
 def staff_message_text(issue_row, *, override_assignee: Optional[str] = None, override_status: Optional[str] = None, company_name: Optional[str] = None) -> str:
     status = override_status or issue_row["status"]
-    assignee = override_assignee or issue_row["assignee_name"]
+    assignee = override_assignee or issue_row.get("assignee_name")
+    deadline = issue_row.get("deadline")
+    
     text = (
         f"Заявка #{issue_row['id']}\n"
         f"🏢 Предприятие: {company_name or '—'}\n"
@@ -613,11 +1129,26 @@ def staff_message_text(issue_row, *, override_assignee: Optional[str] = None, ov
     )
     if assignee:
         text += f"\nОтветственный: {assignee}"
+    if deadline:
+        # Parse deadline to show readable format
+        deadline_display = deadline
+        try:
+            from datetime import datetime
+            # Try to parse ISO format
+            dt = datetime.fromisoformat(deadline.replace('Z', '+00:00'))
+            deadline_display = dt.strftime('%d.%m.%Y %H:%M')
+        except (ValueError, AttributeError):
+            # If it's custom text, use as is
+            pass
+        text += f"\n📅 Срок выполнения: {deadline_display}"
     return text
 
 
 async def main():
-    bot, dp, _ = await on_startup()
+    bot, dp, staff_chat_id = await on_startup()
+    # Устанавливаем команды после создания бота (на случай если не установились при старте)
+    settings = load_settings()
+    await setup_bot_commands(bot, admin_ids=settings.admin_user_ids)
     await dp.start_polling(bot)
 
 
