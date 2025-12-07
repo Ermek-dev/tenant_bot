@@ -68,6 +68,7 @@ async def init_db(path: str) -> aiosqlite.Connection:
     await _conn.executescript(CREATE_SQL)
     await _conn.commit()
     await _migrate_add_company_id_column()
+    await _migrate_add_deadline_column()
     return _conn
 
 
@@ -150,7 +151,7 @@ async def get_issue(issue_id: int) -> Optional[aiosqlite.Row]:
         return await cur.fetchone()
 
 
-async def claim_issue(issue_id: int, assignee_user_id: int, assignee_name: str) -> bool:
+async def claim_issue(issue_id: int, assignee_user_id: int, assignee_name: str, deadline: Optional[str] = None) -> bool:
     conn = _require_conn()
     from datetime import datetime, timezone
 
@@ -159,10 +160,10 @@ async def claim_issue(issue_id: int, assignee_user_id: int, assignee_name: str) 
     cur = await conn.execute(
         """
         UPDATE issues
-        SET status='assigned', assignee_user_id=?, assignee_name=?, updated_at=?
+        SET status='assigned', assignee_user_id=?, assignee_name=?, deadline=?, updated_at=?
         WHERE id=? AND (status='open' OR (status='assigned' AND assignee_user_id IS NULL))
         """,
-        (assignee_user_id, assignee_name, now, issue_id),
+        (assignee_user_id, assignee_name, deadline, now, issue_id),
     )
     await conn.commit()
     return cur.rowcount > 0
@@ -281,4 +282,14 @@ async def _migrate_add_company_id_column() -> None:
         cols = [row[1] for row in await cur.fetchall()]
     if "company_id" not in cols:
         await conn.execute("ALTER TABLE issues ADD COLUMN company_id INTEGER")
+        await conn.commit()
+
+
+async def _migrate_add_deadline_column() -> None:
+    conn = _require_conn()
+    # Check if deadline exists in issues
+    async with conn.execute("PRAGMA table_info(issues)") as cur:
+        cols = [row[1] for row in await cur.fetchall()]
+    if "deadline" not in cols:
+        await conn.execute("ALTER TABLE issues ADD COLUMN deadline TEXT")
         await conn.commit()
