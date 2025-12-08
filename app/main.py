@@ -119,14 +119,33 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     # Category selection via text buttons
     @dp.message(ReportStates.choosing_category)
     async def choose_category(message: Message, state: FSMContext):
-        text = (message.text or "").strip().lower()
+        text = (message.text or "").strip()
+        
+        # Check if user pressed a menu button - reset state and handle
+        if text == "🆕 Новая заявка":
+            # Already in issue creation, just remind to select category
+            await message.answer("Выберите категорию:", reply_markup=categories_inline_kb())
+            return
+        elif text == "📋 Мои заявки":
+            await state.clear()
+            await my_issues(message, state)
+            return
+        elif text == "🔑 Привязать предприятие":
+            await state.clear()
+            await menu_bind_company(message, state)
+            return
+        elif text == "ℹ️ Помощь":
+            await state.clear()
+            await menu_help(message, state)
+            return
+        
         mapping = {title.lower(): code for title, code in CATEGORIES}
-        if text not in mapping:
+        if text.lower() not in mapping:
             await message.answer("Пожалуйста, выберите категорию из списка ниже:", reply_markup=None)
             await message.answer("Категории:", reply_markup=categories_inline_kb())
             return
 
-        await state.update_data(category=mapping[text], photos=[], description=None)
+        await state.update_data(category=mapping[text.lower()], photos=[], description=None)
         await message.answer(
             "📝 Опишите проблему:\n"
             "• Отправьте фото с подписью\n"
@@ -136,11 +155,32 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         await state.set_state(ReportStates.creating_report)
 
 
+
     
 
     # Simplified report creation - automatic preview with send button
     @dp.message(ReportStates.creating_report, F.content_type.in_({ContentType.PHOTO, ContentType.TEXT}))
     async def creating_report_input(message: Message, state: FSMContext):
+        text = (message.text or "").strip()
+        
+        # Check if user pressed a menu button - reset state and handle
+        if text == "🆕 Новая заявка":
+            # Already in issue creation, remind current state
+            await message.answer("Вы уже создаёте заявку. Продолжите или отправьте /cancel для отмены.")
+            return
+        elif text == "📋 Мои заявки":
+            await state.clear()
+            await my_issues(message, state)
+            return
+        elif text == "🔑 Привязать предприятие":
+            await state.clear()
+            await menu_bind_company(message, state)
+            return
+        elif text == "ℹ️ Помощь":
+            await state.clear()
+            await menu_help(message, state)
+            return
+        
         data = await state.get_data()
         photos: list[str] = list(data.get("photos", []))
         existing_description = (data.get("description") or "").strip()
@@ -195,6 +235,13 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         if not cb.data:
             await cb.answer()
             return
+        
+        # Check if user is still in category selection state
+        current_state = await state.get_state()
+        if current_state != ReportStates.choosing_category:
+            await cb.answer("Выбор категории уже завершён", show_alert=False)
+            return
+        
         code = cb.data.split(":", 1)[1]
         category_name = human_category(code)
         
@@ -300,18 +347,22 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
                 f"От: {reporter_name}\n\n"
                 f"Описание:\n{description}"
             )
-            if photos:
-                if len(photos) == 1:
-                    await bot.send_photo(staff_chat_id, photos[0], caption=text)
+            try:
+                if photos:
+                    if len(photos) == 1:
+                        await bot.send_photo(staff_chat_id, photos[0], caption=text)
+                    else:
+                        media = [InputMediaPhoto(media=fid) for fid in photos[:10]]
+                        media[0].caption = text
+                        await bot.send_media_group(staff_chat_id, cast(List[MediaUnion], media))
+                    staff_msg = await bot.send_message(chat_id=staff_chat_id, text=f"Заявка #{issue_id}", reply_markup=staff_task_kb(issue_id, assigned_to=None))
+                    await db.set_staff_message(issue_id, staff_chat_id, staff_msg.message_id)
                 else:
-                    media = [InputMediaPhoto(media=fid) for fid in photos[:10]]
-                    media[0].caption = text
-                    await bot.send_media_group(staff_chat_id, cast(List[MediaUnion], media))
-                staff_msg = await bot.send_message(chat_id=staff_chat_id, text=f"Заявка #{issue_id}", reply_markup=staff_task_kb(issue_id, assigned_to=None))
-                await db.set_staff_message(issue_id, staff_chat_id, staff_msg.message_id)
-            else:
-                staff_msg = await bot.send_message(chat_id=staff_chat_id, text=text, reply_markup=staff_task_kb(issue_id, assigned_to=None))
-                await db.set_staff_message(issue_id, staff_chat_id, staff_msg.message_id)
+                    staff_msg = await bot.send_message(chat_id=staff_chat_id, text=text, reply_markup=staff_task_kb(issue_id, assigned_to=None))
+                    await db.set_staff_message(issue_id, staff_chat_id, staff_msg.message_id)
+            except Exception as e:
+                # Staff chat may be unavailable, but issue is still created
+                print(f"Failed to send issue #{issue_id} to staff chat: {e}")
 
             # Hide preview buttons
             try:
@@ -706,7 +757,8 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     # My issues
     @dp.message(Command("my"))
     @dp.message(F.text == "📋 Мои заявки")
-    async def my_issues(message: Message):
+    async def my_issues(message: Message, state: FSMContext):
+        await state.clear()  # Reset any active state
         if message.from_user is None:
             return
         rows = await db.user_issues(message.from_user.id, limit=5)
@@ -726,12 +778,14 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     # Bind company via menu
     @dp.message(F.text == "🔑 Привязать предприятие")
     async def menu_bind_company(message: Message, state: FSMContext):
+        await state.clear()  # Reset any active state first
         await state.set_state(CompanyStates.entering_code)
-        await message.answer("Введите код предприятия:")
+        await message.answer("Введите код предприятия (или /cancel для отмены):")
 
     # Help via menu
     @dp.message(F.text == "ℹ️ Помощь")
-    async def menu_help(message: Message):
+    async def menu_help(message: Message, state: FSMContext):
+        await state.clear()  # Reset any active state
         await cmd_help(message)
 
     # Cancel any flow
@@ -1043,14 +1097,17 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             f"Ваша заявка #{issue_id} выполнена.\n"
             f"Комментарий исполнителя: {text or 'без комментария'}"
         )
-        await bot.send_message(tenant_chat_id, notify_text)
-        if photos:
-            if len(photos) == 1:
-                await bot.send_photo(tenant_chat_id, photos[0], caption=f"Фотоотчёт по заявке #{issue_id}")
-            else:
-                media = [InputMediaPhoto(media=fid) for fid in photos[:10]]
-                await bot.send_media_group(tenant_chat_id, cast(List[MediaUnion], media))
-                await bot.send_message(tenant_chat_id, f"Фотоотчёт по заявке #{issue_id}")
+        try:
+            await bot.send_message(tenant_chat_id, notify_text)
+            if photos:
+                if len(photos) == 1:
+                    await bot.send_photo(tenant_chat_id, photos[0], caption=f"Фотоотчёт по заявке #{issue_id}")
+                else:
+                    media = [InputMediaPhoto(media=fid) for fid in photos[:10]]
+                    await bot.send_media_group(tenant_chat_id, cast(List[MediaUnion], media))
+                    await bot.send_message(tenant_chat_id, f"Фотоотчёт по заявке #{issue_id}")
+        except Exception:
+            pass  # User may have blocked the bot
 
         # Update staff message
         try:
