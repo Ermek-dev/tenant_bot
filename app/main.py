@@ -947,8 +947,8 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         
         try:
             # Try to edit original message if possible
-            staff_chat_id = issue.get("staff_chat_id")
-            staff_message_id = issue.get("staff_message_id")
+            staff_chat_id = issue["staff_chat_id"]
+            staff_message_id = issue["staff_message_id"]
             if staff_chat_id and staff_message_id:
                 await bot.edit_message_text(
                     chat_id=staff_chat_id,
