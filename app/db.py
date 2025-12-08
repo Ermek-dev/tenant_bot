@@ -267,7 +267,7 @@ async def user_issues(user_id: int, limit: int = 5) -> List[aiosqlite.Row]:
     conn = _require_conn()
     conn.row_factory = aiosqlite.Row
     async with conn.execute(
-        "SELECT id, category, status, created_at FROM issues WHERE user_id=? ORDER BY id DESC LIMIT ?",
+        "SELECT id, category, status, assignee_name, created_at FROM issues WHERE user_id=? ORDER BY id DESC LIMIT ?",
         (user_id, limit),
     ) as cur:
         rows = await cur.fetchall()
