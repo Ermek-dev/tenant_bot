@@ -280,6 +280,14 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
 
         # Уведомления
         if staff_chat_id is None:
+            # Hide preview buttons
+            try:
+                await cb.message.edit_text(
+                    f"✅ Заявка #{issue_id} отправлена!",
+                    reply_markup=None
+                )
+            except Exception:
+                pass
             await cb.message.answer(
                 f"Благодарим за обращение! Ваша заявка принята. Номер: #{issue_id}.",
                 reply_markup=main_menu(),
@@ -287,9 +295,9 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         else:
             text = (
                 f"🆕 Заявка #{issue_id}\n"
-                f"🏢 Предприятие: {company['name']} (ID {company['id']})\n"
+                f"🏢 Предприятие: {company['name']}\n"
                 f"Категория: {human_category(category)}\n"
-                f"От: {reporter_name} (id {cb.from_user.id})\n\n"
+                f"От: {reporter_name}\n\n"
                 f"Описание:\n{description}"
             )
             if photos:
@@ -305,12 +313,21 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
                 staff_msg = await bot.send_message(chat_id=staff_chat_id, text=text, reply_markup=staff_task_kb(issue_id, assigned_to=None))
                 await db.set_staff_message(issue_id, staff_chat_id, staff_msg.message_id)
 
+            # Hide preview buttons
+            try:
+                await cb.message.edit_text(
+                    f"✅ Заявка #{issue_id} отправлена!",
+                    reply_markup=None
+                )
+            except Exception:
+                pass
             await cb.message.answer(
                 f"Благодарим за обращение! Ваша заявка принята. Номер: #{issue_id}.",
                 reply_markup=main_menu(),
             )
 
         await state.clear()
+
 
 
     @dp.message(Command("setstaffchat"))
@@ -697,9 +714,13 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             await message.answer("У вас пока нет заявок.")
             return
         lines = []
+        status_map = {"open": ("🟡", "ожидает"), "assigned": ("🟠", "в работе"), "closed": ("🟢", "выполнена")}
         for r in rows:
-            status_emoji = {"open": "🟡", "assigned": "🟠", "closed": "🟢"}.get(r["status"], "⚪️")
-            lines.append(f"{status_emoji} #{r['id']} — {human_category(r['category'])}")
+            emoji, status_text = status_map.get(r["status"], ("⚪️", r["status"]))
+            line = f"{emoji} #{r['id']} — {human_category(r['category'])} — {status_text}"
+            if r["status"] == "assigned" and r["assignee_name"]:
+                line += f" ({r['assignee_name']})"
+            lines.append(line)
         await message.answer("Ваши последние заявки:\n" + "\n".join(lines))
 
     # Bind company via menu
@@ -839,22 +860,37 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             except Exception:
                 pass  # Ignore errors when sending notification
             
-            # Update staff message
+            # Hide deadline selection buttons (edit message to remove buttons)
+            try:
+                if isinstance(cb.message, Message):
+                    await cb.message.edit_text(
+                        f"✅ Заявка #{issue_id} взята в работу.\n📅 Срок: {deadline_text}",
+                        reply_markup=None
+                    )
+            except Exception:
+                pass
+            
+            # Update staff message (the original issue message)
             comp = await db.get_company(issue["company_id"]) if issue["company_id"] else None
             updated_issue = await db.get_issue(issue_id)
             text = staff_message_text(updated_issue, company_name=(comp["name"] if comp else None))
             
             try:
-                if isinstance(cb.message, Message):
-                    await cb.message.edit_text(text, reply_markup=staff_task_kb(issue_id, assigned_to=assignee_name))
-                else:
-                    raise Exception("Inaccessible message")
+                staff_chat_id = issue["staff_chat_id"]
+                staff_message_id = issue["staff_message_id"]
+                if staff_chat_id and staff_message_id:
+                    await bot.edit_message_text(
+                        chat_id=staff_chat_id,
+                        message_id=staff_message_id,
+                        text=text,
+                        reply_markup=staff_task_kb(issue_id, assigned_to=assignee_name)
+                    )
             except Exception:
-                if cb.message:
-                    await cb.message.answer(text, reply_markup=staff_task_kb(issue_id, assigned_to=assignee_name))
+                pass
             
             await cb.answer(f"Заявка взята в работу. Срок: {deadline_text}")
             await state.clear()
+
 
     # Staff: handle custom deadline text input
     @dp.message(ClaimStates.entering_custom_deadline)
@@ -1116,14 +1152,14 @@ def human_category(code: str) -> str:
 
 def staff_message_text(issue_row, *, override_assignee: Optional[str] = None, override_status: Optional[str] = None, company_name: Optional[str] = None) -> str:
     status = override_status or issue_row["status"]
-    assignee = override_assignee or issue_row.get("assignee_name")
-    deadline = issue_row.get("deadline")
+    assignee = override_assignee or issue_row["assignee_name"]
+    deadline = issue_row["deadline"]
     
     text = (
         f"Заявка #{issue_row['id']}\n"
         f"🏢 Предприятие: {company_name or '—'}\n"
         f"Категория: {human_category(issue_row['category'])}\n"
-        f"От: {issue_row['user_name']} (id {issue_row['user_id']})\n\n"
+        f"От: {issue_row['user_name']}\n\n"
         f"Описание:\n{issue_row['description']}\n\n"
         f"Статус: {status}"
     )
