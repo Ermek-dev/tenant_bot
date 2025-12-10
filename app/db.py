@@ -283,6 +283,44 @@ async def user_issues(user_id: int, limit: int = 5) -> List[aiosqlite.Row]:
         return list(rows)
 
 
+async def all_pending_issues(limit: int = 5, offset: int = 0) -> List[aiosqlite.Row]:
+    """Get all pending (open or assigned) issues for admin/staff view with pagination.
+    
+    Args:
+        limit: Maximum number of issues to return per page.
+        offset: Number of issues to skip (for pagination).
+        
+    Returns:
+        List of issues with open or assigned status, ordered by newest first.
+    """
+    conn = _require_conn()
+    conn.row_factory = aiosqlite.Row
+    async with conn.execute(
+        """SELECT id, category, status, assignee_name, user_name, created_at 
+           FROM issues 
+           WHERE status IN ('open', 'assigned') 
+           ORDER BY id DESC 
+           LIMIT ? OFFSET ?""",
+        (limit, offset),
+    ) as cur:
+        rows = await cur.fetchall()
+        return list(rows)
+
+
+async def count_pending_issues() -> int:
+    """Count all pending (open or assigned) issues.
+    
+    Returns:
+        Total count of pending issues.
+    """
+    conn = _require_conn()
+    async with conn.execute(
+        "SELECT COUNT(*) FROM issues WHERE status IN ('open', 'assigned')"
+    ) as cur:
+        row = await cur.fetchone()
+        return int(row[0]) if row else 0
+
+
 async def _migrate_add_company_id_column() -> None:
     conn = _require_conn()
     # Check if company_id exists in issues
