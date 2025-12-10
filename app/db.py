@@ -1,6 +1,8 @@
 import aiosqlite
 import os
 import asyncio
+import secrets
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -62,6 +64,14 @@ CREATE TABLE IF NOT EXISTS issue_photos (
 
 
 async def init_db(path: str) -> aiosqlite.Connection:
+    """Initialize database connection and run migrations.
+    
+    Args:
+        path: Path to SQLite database file.
+        
+    Returns:
+        Active database connection.
+    """
     global _conn
     os.makedirs(os.path.dirname(path), exist_ok=True)
     _conn = await aiosqlite.connect(path)
@@ -103,8 +113,13 @@ async def create_issue(
     tenant_chat_id: int,
     company_id: int,
 ) -> int:
+    """Create a new issue in the database.
+    
+    Returns:
+        ID of the created issue.
+    """
     conn = _require_conn()
-    from datetime import datetime, timezone
+
 
     now = datetime.now(timezone.utc).isoformat()
     cur = await conn.execute(
@@ -122,7 +137,6 @@ async def create_issue(
 
 async def add_issue_photo(issue_id: int, file_id: str, *, is_completion: bool, uploader_user_id: Optional[int]) -> None:
     conn = _require_conn()
-    from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc).isoformat()
     await conn.execute(
@@ -134,7 +148,6 @@ async def add_issue_photo(issue_id: int, file_id: str, *, is_completion: bool, u
 
 async def set_staff_message(issue_id: int, staff_chat_id: int, staff_message_id: int) -> None:
     conn = _require_conn()
-    from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc).isoformat()
     await conn.execute(
@@ -153,7 +166,6 @@ async def get_issue(issue_id: int) -> Optional[aiosqlite.Row]:
 
 async def claim_issue(issue_id: int, assignee_user_id: int, assignee_name: str, deadline: Optional[str] = None) -> bool:
     conn = _require_conn()
-    from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc).isoformat()
     # Only claim if status is open and not assigned
@@ -171,7 +183,6 @@ async def claim_issue(issue_id: int, assignee_user_id: int, assignee_name: str, 
 
 async def complete_issue(issue_id: int) -> None:
     conn = _require_conn()
-    from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc).isoformat()
     await conn.execute(
@@ -196,8 +207,6 @@ async def get_issue_photos(issue_id: int, *, is_completion: Optional[bool] = Non
 # Companies helpers
 async def create_company(name: str, invite_code: Optional[str]) -> int:
     conn = _require_conn()
-    from datetime import datetime, timezone
-    import secrets
 
     code = invite_code or secrets.token_hex(3).upper()
     now = datetime.now(timezone.utc).isoformat()
@@ -246,7 +255,6 @@ async def get_user_company(user_id: int) -> Optional[aiosqlite.Row]:
 
 async def set_user_company(user_id: int, company_id: int) -> None:
     conn = _require_conn()
-    from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc).isoformat()
     await conn.execute(

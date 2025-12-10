@@ -1,6 +1,14 @@
 import asyncio
+import logging
 from contextlib import suppress
 from typing import List, Optional, cast
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
@@ -86,7 +94,7 @@ async def setup_bot_commands(bot: Bot, admin_ids: set[int]):
                     pass
     except Exception as e:
         # Логируем ошибку, но не прерываем работу бота
-        print(f"Ошибка при установке команд меню: {e}")
+        logger.error(f"Ошибка при установке команд меню: {e}")
 
 
 def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
@@ -376,7 +384,7 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
                     await db.set_staff_message(issue_id, staff_chat_id, staff_msg.message_id)
             except Exception as e:
                 # Staff chat may be unavailable, but issue is still created
-                print(f"Failed to send issue #{issue_id} to staff chat: {e}")
+                logger.error(f"Failed to send issue #{issue_id} to staff chat: {e}")
 
             # Hide preview buttons
             try:
@@ -972,7 +980,7 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
                     # Обновляем привязку к новому сообщению для кнопки "Завершить"
                     await db.set_staff_message(issue_id, staff_chat_id, new_staff_msg.message_id)
             except Exception as e:
-                print(f"Failed to send 'Complete' button for issue #{issue_id}: {e}")
+                logger.error(f"Failed to send 'Complete' button for issue #{issue_id}: {e}")
             
             await cb.answer(f"Заявка взята в работу. Срок: {deadline_text}")
             await state.clear()
