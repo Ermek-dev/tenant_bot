@@ -32,6 +32,8 @@ from app.keyboards import (
     description_nav_kb,
     deadline_choice_kb,
     send_issue_kb,
+    all_issues_page_kb,
+    confirm_action_kb,
 )
 from app.utils import user_display_name
 
@@ -53,14 +55,19 @@ async def on_startup() -> tuple[Bot, Dispatcher, int | None]:
     dp = Dispatcher()
 
     # Set up command menu (кнопка "/")
-    await setup_bot_commands(bot, admin_ids=settings.admin_user_ids)
+    await setup_bot_commands(bot, admin_ids=settings.admin_user_ids, staff_chat_id=staff_chat_id)
     
     register_handlers(dp, bot, admin_ids=settings.admin_user_ids)
     return bot, dp, staff_chat_id
 
-
-async def setup_bot_commands(bot: Bot, admin_ids: set[int]):
-    """Настройка меню команд бота (кнопка '/')."""
+async def setup_bot_commands(bot: Bot, admin_ids: set[int], staff_chat_id: int | None = None):
+    """Настройка меню команд бота (кнопка '/').
+    
+    Args:
+        bot: Bot instance
+        admin_ids: Set of admin user IDs
+        staff_chat_id: Staff chat group ID (optional)
+    """
     try:
         commands = [
             BotCommand(command="start", description="Главное меню"),
@@ -77,6 +84,7 @@ async def setup_bot_commands(bot: Bot, admin_ids: set[int]):
         # Для администраторов добавляем дополнительные команды
         if admin_ids:
             admin_commands = commands + [
+                BotCommand(command="all", description="Все невыполненные заявки (админ)"),
                 BotCommand(command="company_create", description="Создать предприятие (админ)"),
                 BotCommand(command="company_list", description="Список предприятий (админ)"),
                 BotCommand(command="setstaffchat", description="Установить группу (админ)"),
@@ -92,12 +100,33 @@ async def setup_bot_commands(bot: Bot, admin_ids: set[int]):
                 except Exception:
                     # Игнорируем ошибки для пользователей, которые ещё не писали боту
                     pass
+        
+        # Для staff chat группы добавляем /all
+        if staff_chat_id:
+            staff_commands = [
+                BotCommand(command="start", description="Главное меню"),
+                BotCommand(command="all", description="Все невыполненные заявки"),
+                BotCommand(command="help", description="Справка"),
+            ]
+            try:
+                await bot.set_my_commands(
+                    staff_commands,
+                    scope=BotCommandScopeChat(chat_id=staff_chat_id)
+                )
+            except Exception:
+                # Группа может быть недоступна
+                pass
     except Exception as e:
         # Логируем ошибку, но не прерываем работу бота
         logger.error(f"Ошибка при установке команд меню: {e}")
 
 
 def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
+    
+    def is_admin_user(user_id: int) -> bool:
+        """Check if user is an admin."""
+        return user_id in admin_ids
+    
     # /start
     @dp.message(CommandStart())
     async def cmd_start(message: Message, state: FSMContext):
@@ -105,6 +134,7 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         # Check company binding
         if message.from_user is None:
             return
+        is_admin = is_admin_user(message.from_user.id)
         company = await db.get_user_company(message.from_user.id)
         if not company:
             await message.answer(
@@ -114,7 +144,7 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
                 "Попросите у администратора код и отправьте его: /company_join <код>",
                 reply_markup=enter_company_code_kb(),
             )
-            await message.answer("Либо используйте меню ниже.", reply_markup=main_menu())
+            await message.answer("Либо используйте меню ниже.", reply_markup=main_menu(is_admin=is_admin))
             return
         await message.answer(
             "Добрый день!\n"
@@ -122,7 +152,7 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             "С какой проблемой вы столкнулись?",
             reply_markup=quick_start_kb(),
         )
-        await message.answer("Выберите действие:", reply_markup=main_menu())
+        await message.answer("Выберите действие:", reply_markup=main_menu(is_admin=is_admin))
 
     # Category selection via text buttons
     @dp.message(ReportStates.choosing_category)
@@ -137,6 +167,10 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         elif text == "📋 Мои заявки":
             await state.clear()
             await my_issues(message, state)
+            return
+        elif text == "📋 Все заявки":
+            await state.clear()
+            await all_issues_handler(message, state)
             return
         elif text == "🔑 Привязать предприятие":
             await state.clear()
@@ -179,6 +213,10 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         elif text == "📋 Мои заявки":
             await state.clear()
             await my_issues(message, state)
+            return
+        elif text == "📋 Все заявки":
+            await state.clear()
+            await all_issues_handler(message, state)
             return
         elif text == "🔑 Привязать предприятие":
             await state.clear()
@@ -345,7 +383,7 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
                 pass
             await cb.message.answer(
                 f"Благодарим за обращение! Ваша заявка принята. Номер: #{issue_id}.",
-                reply_markup=main_menu(),
+                reply_markup=main_menu(is_admin=is_admin_user(cb.from_user.id)),
             )
         else:
             text = (
@@ -396,7 +434,7 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
                 pass
             await cb.message.answer(
                 f"Благодарим за обращение! Ваша заявка принята. Номер: #{issue_id}.",
-                reply_markup=main_menu(),
+                reply_markup=main_menu(is_admin=is_admin_user(cb.from_user.id)),
             )
 
         await state.clear()
@@ -700,7 +738,7 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
                 f"<b>{comp['name']}</b> (#{comp['id']})\n\n"
                 f"Вы можете создать заявку через меню.",
                 parse_mode="HTML",
-                reply_markup=main_menu()
+                reply_markup=main_menu(is_admin=is_admin_user(message.from_user.id))
             )
             return
         
@@ -713,7 +751,7 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
                 f"Стало: <b>{comp['name']}</b> (#{comp['id']})\n\n"
                 f"Теперь вы можете создавать заявки от имени нового предприятия.",
                 parse_mode="HTML",
-                reply_markup=main_menu()
+                reply_markup=main_menu(is_admin=is_admin_user(message.from_user.id))
             )
         else:
             await message.answer(
@@ -722,7 +760,7 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
                 f"🆔 ID: #{comp['id']}\n\n"
                 f"Теперь вы можете создавать заявки. Нажмите кнопку ниже:",
                 parse_mode="HTML",
-                reply_markup=main_menu()
+                reply_markup=main_menu(is_admin=is_admin_user(message.from_user.id))
             )
 
     # Tenant: enter company code via UI
@@ -747,7 +785,7 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             return
         await db.set_user_company(message.from_user.id, comp["id"])
         await state.clear()
-        await message.answer(f"Привязано предприятие: {comp['name']} (#{comp['id']}).", reply_markup=main_menu())
+        await message.answer(f"Привязано предприятие: {comp['name']} (#{comp['id']}).", reply_markup=main_menu(is_admin=is_admin_user(message.from_user.id)))
 
     # New issue entrypoint via menu
     @dp.message(F.text == "🆕 Новая заявка")
@@ -776,7 +814,7 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         if cb.message:
             await cb.message.answer("Выберите категорию:", reply_markup=categories_inline_kb())
 
-    # My issues
+    # My issues (for regular users)
     @dp.message(Command("my"))
     @dp.message(F.text == "📋 Мои заявки")
     async def my_issues(message: Message, state: FSMContext):
@@ -797,6 +835,214 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             lines.append(line)
         await message.answer("Ваши последние заявки:\n" + "\n".join(lines))
 
+    # All issues (for admin via button)
+    @dp.message(F.text == "📋 Все заявки")
+    async def all_issues_handler(message: Message, state: FSMContext):
+        await state.clear()  # Reset any active state
+        if message.from_user is None:
+            return
+        # Only admins can see all issues
+        if message.from_user.id not in admin_ids:
+            await message.answer("⛔️ Эта функция доступна только администраторам.")
+            return
+        await _show_all_pending_issues(message, page=0)
+
+    # /all command for staff chat
+    @dp.message(Command("all"))
+    async def all_issues_command(message: Message, state: FSMContext):
+        await state.clear()
+        if message.from_user is None:
+            return
+        
+        # Allow in staff chat or for admins
+        staff_chat_id = None
+        setting_chat = await db.get_setting("staff_chat_id")
+        if setting_chat:
+            with suppress(ValueError):
+                staff_chat_id = int(setting_chat)
+        
+        is_admin = message.from_user.id in admin_ids
+        is_staff_chat = message.chat.id == staff_chat_id
+        
+        if not is_admin and not is_staff_chat:
+            await message.answer("⛔️ Эта команда доступна только в группе сотрудников или для администраторов.")
+            return
+        
+        await _show_all_pending_issues(message, page=0)
+
+    ISSUES_PER_PAGE = 5
+
+    async def _show_all_pending_issues(message: Message, page: int = 0):
+        """Helper to display paginated pending issues with action buttons."""
+        total_count = await db.count_pending_issues()
+        if total_count == 0:
+            await message.answer("✅ Нет невыполненных заявок.")
+            return
+        
+        total_pages = (total_count + ISSUES_PER_PAGE - 1) // ISSUES_PER_PAGE
+        offset = page * ISSUES_PER_PAGE
+        rows = await db.all_pending_issues(limit=ISSUES_PER_PAGE, offset=offset)
+        
+        lines = []
+        status_map = {"open": ("🟡", "ожидает"), "assigned": ("🟠", "в работе")}
+        for r in rows:
+            emoji, status_text = status_map.get(r["status"], ("⚪️", r["status"]))
+            line = f"{emoji} #{r['id']} — {human_category(r['category'])} — {status_text}"
+            if r["user_name"]:
+                line += f"\n   👤 От: {r['user_name']}"
+            if r["status"] == "assigned" and r["assignee_name"]:
+                line += f"\n   🛠 Исп.: {r['assignee_name']}"
+            lines.append(line)
+        
+        header = f"📋 <b>Невыполненные заявки</b> ({total_count}):\n\n"
+        legend = "\n\n<i>🛠=Взяться  ✅=Завершить</i>"
+        await message.answer(
+            header + "\n\n".join(lines) + legend, 
+            parse_mode="HTML",
+            reply_markup=all_issues_page_kb(list(rows), page, total_pages)
+        )
+
+    # Pagination callback
+    @dp.callback_query(F.data.startswith("all_page:"))
+    async def all_page_callback(cb: CallbackQuery, state: FSMContext):
+        if not cb.data or not cb.message:
+            await cb.answer()
+            return
+        
+        page = int(cb.data.split(":")[1])
+        
+        # Get data for the new page
+        total_count = await db.count_pending_issues()
+        if total_count == 0:
+            await cb.message.edit_text("✅ Нет невыполненных заявок.")
+            await cb.answer()
+            return
+        
+        total_pages = (total_count + ISSUES_PER_PAGE - 1) // ISSUES_PER_PAGE
+        offset = page * ISSUES_PER_PAGE
+        rows = await db.all_pending_issues(limit=ISSUES_PER_PAGE, offset=offset)
+        
+        lines = []
+        status_map = {"open": ("🟡", "ожидает"), "assigned": ("🟠", "в работе")}
+        for r in rows:
+            emoji, status_text = status_map.get(r["status"], ("⚪️", r["status"]))
+            line = f"{emoji} #{r['id']} — {human_category(r['category'])} — {status_text}"
+            if r["user_name"]:
+                line += f"\n   👤 От: {r['user_name']}"
+            if r["status"] == "assigned" and r["assignee_name"]:
+                line += f"\n   🛠 Исп.: {r['assignee_name']}"
+            lines.append(line)
+        
+        header = f"📋 <b>Невыполненные заявки</b> ({total_count}):\n\n"
+        legend = "\n\n<i>🛠=Взяться  ✅=Завершить</i>"
+        
+        try:
+            await cb.message.edit_text(
+                header + "\n\n".join(lines) + legend,
+                parse_mode="HTML",
+                reply_markup=all_issues_page_kb(list(rows), page, total_pages)
+            )
+        except Exception:
+            pass  # Message unchanged
+        await cb.answer()
+
+    # Confirmation for claim from list
+    @dp.callback_query(F.data.startswith("confirm_claim:"))
+    async def confirm_claim_callback(cb: CallbackQuery, state: FSMContext):
+        if not cb.data or not cb.message:
+            await cb.answer()
+            return
+        
+        issue_id = int(cb.data.split(":")[1])
+        issue = await db.get_issue(issue_id)
+        
+        if not issue:
+            await cb.answer("⚠️ Заявка не найдена", show_alert=True)
+            return
+        
+        if issue["status"] != "open":
+            await cb.answer("⚠️ Заявка уже взята в работу", show_alert=True)
+            return
+        
+        text = (
+            f"⚠️ <b>Подтвердите действие</b>\n\n"
+            f"Взяться за заявку #{issue_id}?\n"
+            f"📋 {human_category(issue['category'])}\n"
+            f"👤 От: {issue['user_name'] or '—'}"
+        )
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=confirm_action_kb("claim", issue_id))
+        await cb.answer()
+
+    # Confirmation for complete from list
+    @dp.callback_query(F.data.startswith("confirm_complete:"))
+    async def confirm_complete_callback(cb: CallbackQuery, state: FSMContext):
+        if not cb.data or not cb.message:
+            await cb.answer()
+            return
+        
+        issue_id = int(cb.data.split(":")[1])
+        issue = await db.get_issue(issue_id)
+        
+        if not issue:
+            await cb.answer("⚠️ Заявка не найдена", show_alert=True)
+            return
+        
+        if issue["status"] != "assigned":
+            await cb.answer("⚠️ Заявка не в работе", show_alert=True)
+            return
+        
+        text = (
+            f"⚠️ <b>Подтвердите действие</b>\n\n"
+            f"Завершить заявку #{issue_id}?\n"
+            f"📋 {human_category(issue['category'])}\n"
+            f"🛠 Исполнитель: {issue['assignee_name'] or '—'}"
+        )
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=confirm_action_kb("complete", issue_id))
+        await cb.answer()
+
+    # Cancel confirmation
+    @dp.callback_query(F.data == "cancel_confirm")
+    async def cancel_confirm_callback(cb: CallbackQuery, state: FSMContext):
+        if not cb.message:
+            await cb.answer()
+            return
+        
+        # Return to the list
+        await cb.message.delete()
+        if cb.message.chat:
+            # Send fresh list
+            total_count = await db.count_pending_issues()
+            if total_count == 0:
+                await cb.message.answer("✅ Нет невыполненных заявок.")
+            else:
+                total_pages = (total_count + ISSUES_PER_PAGE - 1) // ISSUES_PER_PAGE
+                rows = await db.all_pending_issues(limit=ISSUES_PER_PAGE, offset=0)
+                
+                lines = []
+                status_map = {"open": ("🟡", "ожидает"), "assigned": ("🟠", "в работе")}
+                for r in rows:
+                    emoji, status_text = status_map.get(r["status"], ("⚪️", r["status"]))
+                    line = f"{emoji} #{r['id']} — {human_category(r['category'])} — {status_text}"
+                    if r["user_name"]:
+                        line += f"\n   👤 От: {r['user_name']}"
+                    if r["status"] == "assigned" and r["assignee_name"]:
+                        line += f"\n   🛠 Исп.: {r['assignee_name']}"
+                    lines.append(line)
+                
+                header = f"📋 <b>Невыполненные заявки</b> ({total_count}):\n\n"
+                legend = "\n\n<i>🛠=Взяться  ✅=Завершить</i>"
+                await cb.message.answer(
+                    header + "\n\n".join(lines) + legend,
+                    parse_mode="HTML",
+                    reply_markup=all_issues_page_kb(list(rows), 0, total_pages)
+                )
+        await cb.answer()
+
+    # Noop callback for page number button
+    @dp.callback_query(F.data == "noop")
+    async def noop_callback(cb: CallbackQuery):
+        await cb.answer()
+
     # Bind company via menu
     @dp.message(F.text == "🔑 Привязать предприятие")
     async def menu_bind_company(message: Message, state: FSMContext):
@@ -814,7 +1060,8 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     @dp.message(Command("cancel"))
     async def cmd_cancel(message: Message, state: FSMContext):
         await state.clear()
-        await message.answer("Действие отменено.", reply_markup=main_menu())
+        is_admin = is_admin_user(message.from_user.id) if message.from_user else False
+        await message.answer("Действие отменено.", reply_markup=main_menu(is_admin=is_admin))
 
     # Utility: get chat id and user id for configuration
     @dp.message(Command("chatid"))
@@ -847,10 +1094,18 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         # Show deadline selection instead of claiming immediately
         await state.update_data(claim_issue_id=issue_id, claim_assignee_user_id=cb.from_user.id, claim_assignee_name=display_from(cb))
         if cb.message:
-            await cb.message.answer(
-                f"Выберите срок выполнения заявки #{issue_id}:",
-                reply_markup=deadline_choice_kb(issue_id)
-            )
+            # Edit the confirmation message to show deadline selection
+            try:
+                await cb.message.edit_text(
+                    f"⏰ Выберите срок выполнения заявки #{issue_id}:",
+                    reply_markup=deadline_choice_kb(issue_id)
+                )
+            except Exception:
+                # Fallback: send new message if edit fails
+                await cb.message.answer(
+                    f"⏰ Выберите срок выполнения заявки #{issue_id}:",
+                    reply_markup=deadline_choice_kb(issue_id)
+                )
         await cb.answer()
 
     # Staff: handle deadline selection
@@ -1096,7 +1351,14 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         await state.update_data(complete_issue_id=issue_id, completion_text="", completion_photos=[])
         await state.set_state(CompleteStates.waiting_text)
         if cb.message:
-            await cb.message.answer(f"Завершение заявки #{issue_id}. Пришлите текстовый комментарий (или '-' чтобы пропустить).")
+            # Edit the confirmation message
+            try:
+                await cb.message.edit_text(
+                    f"📝 Завершение заявки #{issue_id}\n\nПришлите текстовый комментарий (или '-' чтобы пропустить).",
+                    reply_markup=None
+                )
+            except Exception:
+                await cb.message.answer(f"📝 Завершение заявки #{issue_id}. Пришлите текстовый комментарий (или '-' чтобы пропустить).")
         await cb.answer()
 
     @dp.message(CompleteStates.waiting_text)
@@ -1184,7 +1446,8 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             pass
 
         if cb.message:
-            await cb.message.answer(f"Заявка #{issue_id} отмечена как выполненная.", reply_markup=main_menu())
+            is_admin = is_admin_user(cb.from_user.id) if cb.from_user else False
+            await cb.message.answer(f"Заявка #{issue_id} отмечена как выполненная.", reply_markup=main_menu(is_admin=is_admin))
         await state.clear()
 
     # Inline cancel for any active flow
@@ -1193,7 +1456,8 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         await state.clear()
         await cb.answer()
         if cb.message:
-            await cb.message.answer("Действие отменено.", reply_markup=main_menu())
+            is_admin = is_admin_user(cb.from_user.id) if cb.from_user else False
+            await cb.message.answer("Действие отменено.", reply_markup=main_menu(is_admin=is_admin))
 
     # Back: from description to categories
     @dp.callback_query(F.data == "back_to_categories")
@@ -1224,6 +1488,14 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         
         is_admin = admin_ids and message.from_user.id in admin_ids
         
+        # Check if in staff chat
+        staff_chat_id = None
+        setting_chat = await db.get_setting("staff_chat_id")
+        if setting_chat:
+            with suppress(ValueError):
+                staff_chat_id = int(setting_chat)
+        is_staff_chat = message.chat.id == staff_chat_id
+        
         help_text = (
             "📚 <b>Справка по командам</b>\n\n"
             "<b>Основные команды:</b>\n"
@@ -1234,9 +1506,17 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             "/cancel — отменить текущее действие\n"
         )
         
+        # Show /all for staff chat members
+        if is_staff_chat and not is_admin:
+            help_text += (
+                "\n<b>Команды сотрудников:</b>\n"
+                "/all — все невыполненные заявки\n"
+            )
+        
         if is_admin:
             help_text += (
                 "\n<b>Команды администратора:</b>\n"
+                "/all — все невыполненные заявки\n"
                 "/company_create &lt;название&gt; [код] — создать предприятие\n"
                 "/company_list — список предприятий\n"
                 "/setstaffchat — установить группу сотрудников (выполнить в группе)\n"
@@ -1302,7 +1582,7 @@ async def main():
     bot, dp, staff_chat_id = await on_startup()
     # Устанавливаем команды после создания бота (на случай если не установились при старте)
     settings = load_settings()
-    await setup_bot_commands(bot, admin_ids=settings.admin_user_ids)
+    await setup_bot_commands(bot, admin_ids=settings.admin_user_ids, staff_chat_id=staff_chat_id)
     await dp.start_polling(bot)
 
 
