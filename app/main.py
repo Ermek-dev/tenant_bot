@@ -350,14 +350,28 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             try:
                 if photos:
                     if len(photos) == 1:
-                        await bot.send_photo(staff_chat_id, photos[0], caption=text)
+                        # Одно фото - отправляем с подписью и кнопкой в одном сообщении
+                        staff_msg = await bot.send_photo(
+                            staff_chat_id, 
+                            photos[0], 
+                            caption=text,
+                            reply_markup=staff_task_kb(issue_id, assigned_to=None)
+                        )
+                        await db.set_staff_message(issue_id, staff_chat_id, staff_msg.message_id)
                     else:
+                        # Несколько фото - сначала альбом, потом краткое сообщение с кнопкой
                         media = [InputMediaPhoto(media=fid) for fid in photos[:10]]
                         media[0].caption = text
                         await bot.send_media_group(staff_chat_id, cast(List[MediaUnion], media))
-                    staff_msg = await bot.send_message(chat_id=staff_chat_id, text=f"Заявка #{issue_id}", reply_markup=staff_task_kb(issue_id, assigned_to=None))
-                    await db.set_staff_message(issue_id, staff_chat_id, staff_msg.message_id)
+                        # Краткое сообщение с кнопкой управления (ссылка на заявку)
+                        staff_msg = await bot.send_message(
+                            chat_id=staff_chat_id, 
+                            text=f"👆 Заявка #{issue_id} | {human_category(category)} | {company['name']}", 
+                            reply_markup=staff_task_kb(issue_id, assigned_to=None)
+                        )
+                        await db.set_staff_message(issue_id, staff_chat_id, staff_msg.message_id)
                 else:
+                    # Без фото - текст с кнопкой в одном сообщении
                     staff_msg = await bot.send_message(chat_id=staff_chat_id, text=text, reply_markup=staff_task_kb(issue_id, assigned_to=None))
                     await db.set_staff_message(issue_id, staff_chat_id, staff_msg.message_id)
             except Exception as e:
@@ -924,23 +938,41 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             except Exception:
                 pass
             
-            # Update staff message (the original issue message)
+            # Update staff message: убираем кнопку со старого сообщения и отправляем новое с кнопкой "Завершить"
             comp = await db.get_company(issue["company_id"]) if issue["company_id"] else None
             updated_issue = await db.get_issue(issue_id)
             text = staff_message_text(updated_issue, company_name=(comp["name"] if comp else None))
             
+            staff_chat_id = issue["staff_chat_id"]
+            staff_message_id = issue["staff_message_id"]
+            
             try:
-                staff_chat_id = issue["staff_chat_id"]
-                staff_message_id = issue["staff_message_id"]
                 if staff_chat_id and staff_message_id:
-                    await bot.edit_message_text(
+                    # Убираем кнопку со старого сообщения (помечаем как взятое)
+                    await bot.edit_message_reply_markup(
                         chat_id=staff_chat_id,
                         message_id=staff_message_id,
-                        text=text,
-                        reply_markup=staff_task_kb(issue_id, assigned_to=assignee_name)
+                        reply_markup=None
                     )
             except Exception:
                 pass
+            
+            try:
+                if staff_chat_id:
+                    # Отправляем НОВОЕ сообщение с кнопкой "Завершить" (внизу чата!)
+                    category_name = human_category(issue["category"]) if issue["category"] else ""
+                    new_staff_msg = await bot.send_message(
+                        chat_id=staff_chat_id,
+                        text=f"🔧 Заявка #{issue_id} в работе\n"
+                             f"📁 {category_name}\n"
+                             f"👤 Исполнитель: {assignee_name}\n"
+                             f"📅 Срок: {deadline_text}",
+                        reply_markup=staff_task_kb(issue_id, assigned_to=assignee_name)
+                    )
+                    # Обновляем привязку к новому сообщению для кнопки "Завершить"
+                    await db.set_staff_message(issue_id, staff_chat_id, new_staff_msg.message_id)
+            except Exception as e:
+                print(f"Failed to send 'Complete' button for issue #{issue_id}: {e}")
             
             await cb.answer(f"Заявка взята в работу. Срок: {deadline_text}")
             await state.clear()
@@ -994,25 +1026,39 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         except Exception:
             pass  # Ignore errors when sending notification
         
-        # Update staff message
+        # Update staff message: убираем кнопку со старого и отправляем новое с "Завершить"
         comp = await db.get_company(issue["company_id"]) if issue["company_id"] else None
-        updated_issue = await db.get_issue(issue_id)
-        text = staff_message_text(updated_issue, company_name=(comp["name"] if comp else None))
+        
+        staff_chat_id = issue["staff_chat_id"]
+        staff_message_id = issue["staff_message_id"]
         
         try:
-            # Try to edit original message if possible
-            staff_chat_id = issue["staff_chat_id"]
-            staff_message_id = issue["staff_message_id"]
             if staff_chat_id and staff_message_id:
-                await bot.edit_message_text(
+                # Убираем кнопку со старого сообщения
+                await bot.edit_message_reply_markup(
                     chat_id=staff_chat_id,
                     message_id=staff_message_id,
-                    text=text,
-                    reply_markup=staff_task_kb(issue_id, assigned_to=assignee_name)
+                    reply_markup=None
                 )
         except Exception:
-            # If edit fails, send new message
-            await message.answer(text, reply_markup=staff_task_kb(issue_id, assigned_to=assignee_name))
+            pass
+        
+        try:
+            if staff_chat_id:
+                # Отправляем НОВОЕ сообщение с кнопкой "Завершить" (внизу чата!)
+                category_name = human_category(issue["category"]) if issue["category"] else ""
+                new_staff_msg = await bot.send_message(
+                    chat_id=staff_chat_id,
+                    text=f"🔧 Заявка #{issue_id} в работе\n"
+                         f"📁 {category_name}\n"
+                         f"👤 Исполнитель: {assignee_name}\n"
+                         f"📅 Срок: {custom_deadline_text}",
+                    reply_markup=staff_task_kb(issue_id, assigned_to=assignee_name)
+                )
+                # Обновляем привязку к новому сообщению
+                await db.set_staff_message(issue_id, staff_chat_id, new_staff_msg.message_id)
+        except Exception:
+            pass
         
         await message.answer(f"✅ Заявка #{issue_id} взята в работу. Срок: {custom_deadline_text}")
         await state.clear()
@@ -1067,6 +1113,13 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     @dp.callback_query(CompleteStates.collecting_photos, F.data == "send_completion")
     async def send_completion(cb: CallbackQuery, state: FSMContext):
         await cb.answer()
+        
+        # Скрываем кнопку отправки
+        try:
+            if cb.message and isinstance(cb.message, Message):
+                await cb.message.edit_text("📤 Отправка отчёта...", reply_markup=None)
+        except Exception:
+            pass
         data = await state.get_data()
         issue_id_val = data.get("complete_issue_id")
         if not isinstance(issue_id_val, int):
