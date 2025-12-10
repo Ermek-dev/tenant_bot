@@ -12,9 +12,15 @@ CATEGORIES = [
 ]
 
 
-def main_menu() -> ReplyKeyboardMarkup:
+def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
+    """Create main menu keyboard.
+    
+    Args:
+        is_admin: If True, show 'Все заявки' instead of 'Мои заявки'.
+    """
+    issues_button = "📋 Все заявки" if is_admin else "📋 Мои заявки"
     buttons = [
-        [KeyboardButton(text="🆕 Новая заявка"), KeyboardButton(text="📋 Мои заявки")],
+        [KeyboardButton(text="🆕 Новая заявка"), KeyboardButton(text=issues_button)],
         [KeyboardButton(text="🔑 Привязать предприятие"), KeyboardButton(text="ℹ️ Помощь")],
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
@@ -107,4 +113,71 @@ def send_issue_kb() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_categories"),
             InlineKeyboardButton(text="⛔️ Отмена", callback_data="cancel_flow"),
         ],
+    ])
+
+
+def all_issues_page_kb(issues: list, page: int, total_pages: int) -> InlineKeyboardMarkup:
+    """Create inline keyboard for paginated all issues list.
+    
+    Args:
+        issues: List of issue rows with id, status, assignee_name
+        page: Current page number (0-indexed)
+        total_pages: Total number of pages
+    """
+    rows = []
+    
+    # Action buttons for each issue (2 per row for compactness)
+    action_row = []
+    for issue in issues:
+        issue_id = issue["id"]
+        if issue["status"] == "open":
+            btn = InlineKeyboardButton(
+                text=f"🛠 #{issue_id}", 
+                callback_data=f"confirm_claim:{issue_id}"
+            )
+        else:  # assigned
+            btn = InlineKeyboardButton(
+                text=f"✅ #{issue_id}", 
+                callback_data=f"confirm_complete:{issue_id}"
+            )
+        action_row.append(btn)
+        if len(action_row) == 3:  # 3 buttons per row
+            rows.append(action_row)
+            action_row = []
+    if action_row:
+        rows.append(action_row)
+    
+    # Navigation row
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="◀️", callback_data=f"all_page:{page - 1}"))
+    nav_row.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton(text="▶️", callback_data=f"all_page:{page + 1}"))
+    
+    if nav_row:
+        rows.append(nav_row)
+    
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def confirm_action_kb(action: str, issue_id: int) -> InlineKeyboardMarkup:
+    """Create confirmation keyboard for claim/complete actions.
+    
+    Args:
+        action: 'claim' or 'complete'
+        issue_id: Issue ID to act on
+    """
+    if action == "claim":
+        confirm_text = "✅ Да, взяться"
+        confirm_data = f"claim:{issue_id}"
+    else:
+        confirm_text = "✅ Да, завершить"
+        confirm_data = f"complete:{issue_id}"
+    
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=confirm_text, callback_data=confirm_data),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_confirm"),
+        ]
     ])
