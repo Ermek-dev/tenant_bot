@@ -1349,36 +1349,35 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             await cb.answer("Только ответственный может завершить.", show_alert=True)
             return
         await state.update_data(complete_issue_id=issue_id, completion_text="", completion_photos=[])
-        await state.set_state(CompleteStates.waiting_text)
+        await state.set_state(CompleteStates.collecting_photos)  # Skip text step, go straight to photos
         if cb.message:
             # Edit the confirmation message
             try:
                 await cb.message.edit_text(
-                    f"📝 Завершение заявки #{issue_id}\n\nПришлите текстовый комментарий (или '-' чтобы пропустить).",
-                    reply_markup=None
+                    f"📷 Завершение заявки #{issue_id}\n\nПришлите фотоотчёт (можно с подписью).\nКогда готово — нажмите кнопку ниже.",
+                    reply_markup=send_completion_kb()
                 )
             except Exception:
-                await cb.message.answer(f"📝 Завершение заявки #{issue_id}. Пришлите текстовый комментарий (или '-' чтобы пропустить).")
+                await cb.message.answer(
+                    f"📷 Завершение заявки #{issue_id}\n\nПришлите фотоотчёт (можно с подписью).",
+                    reply_markup=send_completion_kb()
+                )
         await cb.answer()
-
-    @dp.message(CompleteStates.waiting_text)
-    async def completion_text(message: Message, state: FSMContext):
-        text = (message.text or "").strip()
-        if text == "-":
-            text = ""
-        await state.update_data(completion_text=text, completion_photos=[])
-        await state.set_state(CompleteStates.collecting_photos)
-        await message.answer("Пришлите фотоотчёт (можно несколько). Когда готово — нажмите кнопку ниже.", reply_markup=send_completion_kb())
 
     @dp.message(CompleteStates.collecting_photos, F.content_type == ContentType.PHOTO)
     async def completion_collect_photos(message: Message, state: FSMContext):
         data = await state.get_data()
         photos: List[str] = data.get("completion_photos", [])
+        existing_text = data.get("completion_text", "")
         if not message.photo:
             return
         photos.append(message.photo[-1].file_id)
-        await state.update_data(completion_photos=photos)
-        await message.answer(f"Добавлено фото. Всего: {len(photos)}")
+        # Capture caption from photo as completion text (if not already set)
+        if message.caption and not existing_text:
+            await state.update_data(completion_photos=photos, completion_text=message.caption.strip())
+        else:
+            await state.update_data(completion_photos=photos)
+        await message.answer(f"✅ Добавлено фото. Всего: {len(photos)}")
 
     @dp.callback_query(CompleteStates.collecting_photos, F.data == "send_completion")
     async def send_completion(cb: CallbackQuery, state: FSMContext):
