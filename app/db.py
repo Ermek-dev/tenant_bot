@@ -1,6 +1,8 @@
 import aiosqlite
 import os
 import asyncio
+import secrets
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -62,12 +64,21 @@ CREATE TABLE IF NOT EXISTS issue_photos (
 
 
 async def init_db(path: str) -> aiosqlite.Connection:
+    """Initialize database connection and run migrations.
+    
+    Args:
+        path: Path to SQLite database file.
+        
+    Returns:
+        Active database connection.
+    """
     global _conn
     os.makedirs(os.path.dirname(path), exist_ok=True)
     _conn = await aiosqlite.connect(path)
     await _conn.executescript(CREATE_SQL)
     await _conn.commit()
     await _migrate_add_company_id_column()
+    await _migrate_add_deadline_column()
     return _conn
 
 
@@ -102,8 +113,13 @@ async def create_issue(
     tenant_chat_id: int,
     company_id: int,
 ) -> int:
+    """Create a new issue in the database.
+    
+    Returns:
+        ID of the created issue.
+    """
     conn = _require_conn()
-    from datetime import datetime, timezone
+
 
     now = datetime.now(timezone.utc).isoformat()
     cur = await conn.execute(
@@ -121,7 +137,6 @@ async def create_issue(
 
 async def add_issue_photo(issue_id: int, file_id: str, *, is_completion: bool, uploader_user_id: Optional[int]) -> None:
     conn = _require_conn()
-    from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc).isoformat()
     await conn.execute(
@@ -133,7 +148,6 @@ async def add_issue_photo(issue_id: int, file_id: str, *, is_completion: bool, u
 
 async def set_staff_message(issue_id: int, staff_chat_id: int, staff_message_id: int) -> None:
     conn = _require_conn()
-    from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc).isoformat()
     await conn.execute(
@@ -150,19 +164,18 @@ async def get_issue(issue_id: int) -> Optional[aiosqlite.Row]:
         return await cur.fetchone()
 
 
-async def claim_issue(issue_id: int, assignee_user_id: int, assignee_name: str) -> bool:
+async def claim_issue(issue_id: int, assignee_user_id: int, assignee_name: str, deadline: Optional[str] = None) -> bool:
     conn = _require_conn()
-    from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc).isoformat()
     # Only claim if status is open and not assigned
     cur = await conn.execute(
         """
         UPDATE issues
-        SET status='assigned', assignee_user_id=?, assignee_name=?, updated_at=?
+        SET status='assigned', assignee_user_id=?, assignee_name=?, deadline=?, updated_at=?
         WHERE id=? AND (status='open' OR (status='assigned' AND assignee_user_id IS NULL))
         """,
-        (assignee_user_id, assignee_name, now, issue_id),
+        (assignee_user_id, assignee_name, deadline, now, issue_id),
     )
     await conn.commit()
     return cur.rowcount > 0
@@ -170,7 +183,6 @@ async def claim_issue(issue_id: int, assignee_user_id: int, assignee_name: str) 
 
 async def complete_issue(issue_id: int) -> None:
     conn = _require_conn()
-    from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc).isoformat()
     await conn.execute(
@@ -195,8 +207,6 @@ async def get_issue_photos(issue_id: int, *, is_completion: Optional[bool] = Non
 # Companies helpers
 async def create_company(name: str, invite_code: Optional[str]) -> int:
     conn = _require_conn()
-    from datetime import datetime, timezone
-    import secrets
 
     code = invite_code or secrets.token_hex(3).upper()
     now = datetime.now(timezone.utc).isoformat()
@@ -245,7 +255,6 @@ async def get_user_company(user_id: int) -> Optional[aiosqlite.Row]:
 
 async def set_user_company(user_id: int, company_id: int) -> None:
     conn = _require_conn()
-    from datetime import datetime, timezone
 
     now = datetime.now(timezone.utc).isoformat()
     await conn.execute(
@@ -266,12 +275,50 @@ async def user_issues(user_id: int, limit: int = 5) -> List[aiosqlite.Row]:
     conn = _require_conn()
     conn.row_factory = aiosqlite.Row
     async with conn.execute(
-        "SELECT id, category, status, created_at FROM issues WHERE user_id=? ORDER BY id DESC LIMIT ?",
+        "SELECT id, category, status, assignee_name, created_at FROM issues WHERE user_id=? ORDER BY id DESC LIMIT ?",
         (user_id, limit),
     ) as cur:
         rows = await cur.fetchall()
         # Some type stubs declare fetchall returns Iterable[Row]; coerce to list
         return list(rows)
+
+
+async def all_pending_issues(limit: int = 5, offset: int = 0) -> List[aiosqlite.Row]:
+    """Get all pending (open or assigned) issues for admin/staff view with pagination.
+    
+    Args:
+        limit: Maximum number of issues to return per page.
+        offset: Number of issues to skip (for pagination).
+        
+    Returns:
+        List of issues with open or assigned status, ordered by newest first.
+    """
+    conn = _require_conn()
+    conn.row_factory = aiosqlite.Row
+    async with conn.execute(
+        """SELECT id, category, status, assignee_name, user_name, created_at 
+           FROM issues 
+           WHERE status IN ('open', 'assigned') 
+           ORDER BY id DESC 
+           LIMIT ? OFFSET ?""",
+        (limit, offset),
+    ) as cur:
+        rows = await cur.fetchall()
+        return list(rows)
+
+
+async def count_pending_issues() -> int:
+    """Count all pending (open or assigned) issues.
+    
+    Returns:
+        Total count of pending issues.
+    """
+    conn = _require_conn()
+    async with conn.execute(
+        "SELECT COUNT(*) FROM issues WHERE status IN ('open', 'assigned')"
+    ) as cur:
+        row = await cur.fetchone()
+        return int(row[0]) if row else 0
 
 
 async def _migrate_add_company_id_column() -> None:
@@ -281,4 +328,14 @@ async def _migrate_add_company_id_column() -> None:
         cols = [row[1] for row in await cur.fetchall()]
     if "company_id" not in cols:
         await conn.execute("ALTER TABLE issues ADD COLUMN company_id INTEGER")
+        await conn.commit()
+
+
+async def _migrate_add_deadline_column() -> None:
+    conn = _require_conn()
+    # Check if deadline exists in issues
+    async with conn.execute("PRAGMA table_info(issues)") as cur:
+        cols = [row[1] for row in await cur.fetchall()]
+    if "deadline" not in cols:
+        await conn.execute("ALTER TABLE issues ADD COLUMN deadline TEXT")
         await conn.commit()
