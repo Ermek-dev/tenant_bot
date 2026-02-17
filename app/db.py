@@ -60,6 +60,17 @@ CREATE TABLE IF NOT EXISTS issue_photos (
     created_at TEXT NOT NULL,
     FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS issue_assignees (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    issue_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    user_name TEXT,
+    is_lead INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE,
+    UNIQUE(issue_id, user_id)
+);
 """
 
 
@@ -79,6 +90,7 @@ async def init_db(path: str) -> aiosqlite.Connection:
     await _conn.commit()
     await _migrate_add_company_id_column()
     await _migrate_add_deadline_column()
+    await _migrate_create_issue_assignees_table()
     return _conn
 
 
@@ -178,7 +190,11 @@ async def claim_issue(issue_id: int, assignee_user_id: int, assignee_name: str, 
         (assignee_user_id, assignee_name, deadline, now, issue_id),
     )
     await conn.commit()
-    return cur.rowcount > 0
+    if cur.rowcount > 0:
+        # Also register as lead assignee in issue_assignees
+        await add_issue_assignee(issue_id, assignee_user_id, assignee_name, is_lead=True)
+        return True
+    return False
 
 
 async def complete_issue(issue_id: int) -> None:
@@ -190,6 +206,30 @@ async def complete_issue(issue_id: int) -> None:
         (now, issue_id),
     )
     await conn.commit()
+
+
+async def reassign_issue(issue_id: int) -> bool:
+    """Reset an issue back to 'open' status: clear assignee and remove all assignees.
+
+    Returns True if the issue was successfully reset.
+    """
+    conn = _require_conn()
+    now = datetime.now(timezone.utc).isoformat()
+    cur = await conn.execute(
+        """
+        UPDATE issues
+        SET status='open', assignee_user_id=NULL, assignee_name=NULL, deadline=NULL, updated_at=?
+        WHERE id=? AND status='assigned'
+        """,
+        (now, issue_id),
+    )
+    if cur.rowcount > 0:
+        # Remove all assignees
+        await conn.execute("DELETE FROM issue_assignees WHERE issue_id=?", (issue_id,))
+        await conn.commit()
+        return True
+    await conn.commit()
+    return False
 
 
 async def get_issue_photos(issue_id: int, *, is_completion: Optional[bool] = None) -> List[str]:
@@ -339,3 +379,59 @@ async def _migrate_add_deadline_column() -> None:
     if "deadline" not in cols:
         await conn.execute("ALTER TABLE issues ADD COLUMN deadline TEXT")
         await conn.commit()
+
+
+async def _migrate_create_issue_assignees_table() -> None:
+    conn = _require_conn()
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS issue_assignees (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            issue_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            user_name TEXT,
+            is_lead INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(issue_id) REFERENCES issues(id) ON DELETE CASCADE,
+            UNIQUE(issue_id, user_id)
+        )
+    """)
+    await conn.commit()
+
+
+# --- Issue assignees helpers ---
+
+async def add_issue_assignee(issue_id: int, user_id: int, user_name: str, is_lead: bool = False) -> bool:
+    """Add an assignee to an issue. Returns True if added, False if already exists."""
+    conn = _require_conn()
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        await conn.execute(
+            "INSERT INTO issue_assignees(issue_id, user_id, user_name, is_lead, created_at) VALUES(?,?,?,?,?)",
+            (issue_id, user_id, user_name, 1 if is_lead else 0, now),
+        )
+        await conn.commit()
+        return True
+    except Exception:
+        # UNIQUE constraint — already assigned
+        return False
+
+
+async def get_issue_assignees(issue_id: int) -> List[aiosqlite.Row]:
+    """Get all assignees for an issue, lead first."""
+    conn = _require_conn()
+    conn.row_factory = aiosqlite.Row
+    async with conn.execute(
+        "SELECT * FROM issue_assignees WHERE issue_id=? ORDER BY is_lead DESC, id ASC",
+        (issue_id,),
+    ) as cur:
+        return list(await cur.fetchall())
+
+
+async def is_issue_assignee(issue_id: int, user_id: int) -> bool:
+    """Check if a user is an assignee of an issue."""
+    conn = _require_conn()
+    async with conn.execute(
+        "SELECT 1 FROM issue_assignees WHERE issue_id=? AND user_id=?",
+        (issue_id, user_id),
+    ) as cur:
+        return (await cur.fetchone()) is not None
