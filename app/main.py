@@ -14,7 +14,8 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (CallbackQuery, ContentType, InlineKeyboardMarkup,
                            InputMediaPhoto, Message, MediaUnion, BotCommand,
-                           BotCommandScopeDefault, BotCommandScopeChat)
+                           BotCommandScopeDefault, BotCommandScopeChat,
+                           ReplyKeyboardRemove)
 from aiogram.fsm.context import FSMContext
 
 from app.config import load_settings
@@ -22,6 +23,7 @@ from app import db
 from app.states import ReportStates, CompleteStates, CompanyStates, ClaimStates
 from app.keyboards import (
     main_menu,
+    staff_group_inline_kb,
     skip_or_done_kb,
     staff_task_kb,
     send_completion_kb,
@@ -147,13 +149,28 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             )
             await message.answer("Либо используйте меню ниже.", reply_markup=main_menu(is_admin=is_admin))
             return
-        await message.answer(
-            "Добрый день!\n"
-            "Вас приветствует чат-бот Сервис РТС ЛТД.\n"
-            "С какой проблемой вы столкнулись?",
-            reply_markup=quick_start_kb(),
-        )
-        await message.answer("Выберите действие:", reply_markup=main_menu(is_admin=is_admin))
+        if message.chat.type in ("group", "supergroup"):
+            # In group chat, use INLINE menu and remove old keyboard
+            try:
+                rm_msg = await message.answer("♻️ Обновление меню...", reply_markup=ReplyKeyboardRemove())
+                await rm_msg.delete()
+            except Exception:
+                pass
+            
+            await message.answer(
+                "🤖 <b>Панель управления</b>\n👇 Используйте кнопки ниже для действий:",
+                parse_mode="HTML",
+                reply_markup=staff_group_inline_kb()
+            )
+        else:
+            # In private chat, show full welcome
+            await message.answer(
+                "Добрый день!\n"
+                "Вас приветствует чат-бот Сервис РТС ЛТД.\n"
+                "С какой проблемой вы столкнулись?",
+                reply_markup=quick_start_kb(),
+            )
+            await message.answer("Выберите действие:", reply_markup=main_menu(is_admin=is_admin))
 
     # Category selection via text buttons
     @dp.message(ReportStates.choosing_category)
@@ -791,6 +808,12 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     # New issue entrypoint via menu
     @dp.message(F.text == "🆕 Новая заявка")
     async def menu_new_issue(message: Message, state: FSMContext):
+        if message.chat.type in ("group", "supergroup"):
+            try: await message.delete()
+            except: pass
+            await bot.send_message(message.from_user.id, "Создание заявок доступно только в личном чате.")
+            return
+
         if message.from_user is None:
             return
         company = await db.get_user_company(message.from_user.id)
@@ -803,6 +826,10 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     # Quick start: begin new issue via inline button
     @dp.callback_query(F.data == "new_issue")
     async def cb_new_issue(cb: CallbackQuery, state: FSMContext):
+        if cb.message and cb.message.chat.type in ("group", "supergroup"):
+            await cb.answer("Создание заявок доступно только в личном чате.", show_alert=True)
+            return
+
         await cb.answer()
         if cb.from_user is None:
             return
@@ -819,12 +846,20 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     @dp.message(Command("my"))
     @dp.message(F.text == "📋 Мои заявки")
     async def my_issues(message: Message, state: FSMContext):
+        target_chat_id = message.chat.id
+        if message.chat.type in ("group", "supergroup"):
+            try: await message.delete()
+            except: pass
+            target_chat_id = message.from_user.id
+        
         await state.clear()  # Reset any active state
         if message.from_user is None:
             return
         rows = await db.user_issues(message.from_user.id, limit=5)
         if not rows:
-            await message.answer("У вас пока нет заявок.")
+            try:
+                await bot.send_message(target_chat_id, "У вас пока нет заявок.")
+            except: pass
             return
         lines = []
         status_map = {"open": ("🟡", "ожидает"), "assigned": ("🟠", "в работе"), "closed": ("🟢", "выполнена")}
@@ -834,7 +869,11 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             if r["status"] == "assigned" and r["assignee_name"]:
                 line += f" ({r['assignee_name']})"
             lines.append(line)
-        await message.answer("Ваши последние заявки:\n" + "\n".join(lines))
+        
+        try:
+            await bot.send_message(target_chat_id, "Ваши последние заявки:\n" + "\n".join(lines))
+        except Exception:
+            pass
 
     # All issues (for admin via button)
     @dp.message(F.text == "📋 Все заявки")
@@ -842,11 +881,31 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         await state.clear()  # Reset any active state
         if message.from_user is None:
             return
-        # Only admins can see all issues
-        if message.from_user.id not in admin_ids:
-            await message.answer("⛔️ Эта функция доступна только администраторам.")
+            
+        # Check if user is admin OR in staff chat
+        is_admin = message.from_user.id in admin_ids
+        
+        staff_chat_id = None
+        setting_chat = await db.get_setting("staff_chat_id")
+        if setting_chat:
+            with suppress(ValueError):
+                staff_chat_id = int(setting_chat)
+        is_staff_chat = message.chat.id == staff_chat_id
+
+        if not is_admin and not is_staff_chat:
+            await message.answer("⛔️ Эта функция доступна только администраторам или в группе сотрудников.")
             return
-        await _show_all_pending_issues(message, page=0, requester_user_id=message.from_user.id)
+
+        # If in group/supergroup, delete request and answer in PM
+        target_chat_id = None
+        if message.chat.type in ("group", "supergroup"):
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            target_chat_id = message.from_user.id
+            
+        await _show_all_pending_issues(message, page=0, requester_user_id=message.from_user.id, target_chat_id=target_chat_id)
 
     # /all command for staff chat
     @dp.message(Command("all"))
@@ -869,15 +928,33 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             await message.answer("⛔️ Эта команда доступна только в группе сотрудников или для администраторов.")
             return
         
-        await _show_all_pending_issues(message, page=0, requester_user_id=message.from_user.id)
+        # If in group, send to PM
+        target_chat_id = None
+        if message.chat.type in ("group", "supergroup"):
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            target_chat_id = message.from_user.id
+
+        await _show_all_pending_issues(message, page=0, requester_user_id=message.from_user.id, target_chat_id=target_chat_id)
 
     ISSUES_PER_PAGE = 5
 
-    async def _show_all_pending_issues(message: Message, page: int = 0, requester_user_id: int | None = None):
-        """Helper to display paginated pending issues with action buttons."""
+    async def _show_all_pending_issues(message: Message, page: int = 0, requester_user_id: int | None = None, target_chat_id: int | None = None):
+        """Helper to display paginated pending issues with action buttons.
+        
+        Args:
+            message: The original message triggering the action
+            page: Page number
+            requester_user_id: User ID requesting the list
+            target_chat_id: ID of the chat to send the response to. If None, uses message.chat.id
+        """
+        chat_id = target_chat_id if target_chat_id else message.chat.id
+        
         total_count = await db.count_pending_issues()
         if total_count == 0:
-            await message.answer("✅ Нет невыполненных заявок.")
+            await bot.send_message(chat_id, "✅ Нет невыполненных заявок.")
             return
         
         total_pages = (total_count + ISSUES_PER_PAGE - 1) // ISSUES_PER_PAGE
@@ -906,8 +983,9 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         if user_is_admin:
             legend += "  🔄=Переназначить"
         legend += "</i>"
-        await message.answer(
-            header + "\n\n".join(lines) + legend, 
+        await bot.send_message(
+            chat_id,
+            header + "\n\n".join(lines) + legend,
             parse_mode="HTML",
             reply_markup=all_issues_page_kb(list(rows), page, total_pages, is_admin=user_is_admin)
         )
@@ -1195,6 +1273,12 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     # Bind company via menu
     @dp.message(F.text == "🔑 Привязать предприятие")
     async def menu_bind_company(message: Message, state: FSMContext):
+        if message.chat.type in ("group", "supergroup"):
+            try: await message.delete()
+            except: pass
+            await bot.send_message(message.from_user.id, "Привязка предприятия доступна только в личном чате.")
+            return
+
         await state.clear()  # Reset any active state first
         await state.set_state(CompanyStates.entering_code)
         await message.answer("Введите код предприятия (или /cancel для отмены):")
@@ -1209,8 +1293,21 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     @dp.message(Command("cancel"))
     async def cmd_cancel(message: Message, state: FSMContext):
         await state.clear()
-        is_admin = is_admin_user(message.from_user.id) if message.from_user else False
-        await message.answer("Действие отменено.", reply_markup=main_menu(is_admin=is_admin))
+        
+        reply_markup = None
+        if message.chat.type in ("group", "supergroup"):
+            # In group chat, remove old keyboard and show inline menu
+            try:
+                rm_msg = await message.answer("♻️ Обновление меню...", reply_markup=ReplyKeyboardRemove())
+                await rm_msg.delete()
+            except Exception:
+                pass
+            reply_markup = staff_group_inline_kb()
+            await message.answer("🤖 <b>Панель управления</b>", parse_mode="HTML", reply_markup=reply_markup)
+        else:
+            is_admin = is_admin_user(message.from_user.id) if message.from_user else False
+            reply_markup = main_menu(is_admin=is_admin)
+            await message.answer("Действие отменено.", reply_markup=reply_markup)
 
     # Utility: get chat id and user id for configuration
     @dp.message(Command("chatid"))
@@ -1703,6 +1800,43 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             )
 
 
+    # Group Menu Callbacks
+    @dp.callback_query(F.data == "group_all")
+    async def cb_group_all(cb: CallbackQuery):
+        await cb.answer("Отправляю список заявок в ЛС...", show_alert=False)
+        try:
+            # Need to pass target_chat_id explicitly
+            await _show_all_pending_issues(cb.message, page=0, requester_user_id=cb.from_user.id, target_chat_id=cb.from_user.id)
+        except Exception:
+            await cb.answer("Не удалось отправить сообщение. Напишите боту в ЛС /start.", show_alert=True)
+
+    @dp.callback_query(F.data == "group_help")
+    async def cb_group_help(cb: CallbackQuery):
+        await cb.answer("Отправляю справку в ЛС...", show_alert=False)
+        
+        # Construct help text (simplified logic compared to cmd_help)
+        is_admin = is_admin_user(cb.from_user.id)
+        
+        help_text = (
+            "📚 <b>Справка по командам</b>\n\n"
+            "<b>Для сотрудников:</b>\n"
+            "Вы можете использовать кнопки в закрепленном сообщении группы.\n"
+            "/start — обновить меню\n"
+            "/my — мои последние заявки (в ЛС)\n"
+            "/cancel — отменить текущее действие\n\n"
+        )
+        if is_admin:
+            help_text += (
+                "<b>Для администратора:</b>\n"
+                "/company_add — добавить предприятие\n"
+                "/company_list — список предприятий\n\n"
+            )
+        
+        try:
+            await bot.send_message(cb.from_user.id, help_text, parse_mode="HTML")
+        except Exception:
+            await cb.answer("Не удалось отправить сообщение. Напишите боту в ЛС /start.", show_alert=True)
+
     # Help command - короткая информативная версия
     @dp.message(Command("help"))
     async def cmd_help(message: Message):
@@ -1746,10 +1880,35 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             )
         
         help_text += (
-            "\n💡 <b>Совет:</b> Используйте кнопку '/' для быстрого доступа к командам!"
-        )
-        
-        await message.answer(help_text, parse_mode="HTML")
+        "\n💡 <b>Совет:</b> Используйте кнопку '/' для быстрого доступа к командам!"
+    )
+    
+        # If in group chat, send to PM and delete original message to avoid spam
+        if message.chat.type in ("group", "supergroup"):
+            # Try to delete the command message
+            try:
+                await message.delete()
+            except Exception:
+                pass  # Maybe no delete permissions
+                
+            # Send help to PM
+            try:
+                await bot.send_message(message.from_user.id, help_text, parse_mode="HTML")
+            except Exception:
+                # If user hasn't started bot in PM, we can't message them.
+                # In this case, maybe send a temporary ephemeral-like message or just ignore.
+                # Let's send a short message in group that auto-deletes?
+                # Or just leave it be. For now, let's try to send a hint in group.
+                try:
+                    msg = await message.answer(f"{user_display_name(message.from_user)}, чтобы получить справку, напишите мне в ЛС: @{(await bot.get_me()).username}")
+                    # Wait 5 sec and delete
+                    await asyncio.sleep(5)
+                    await msg.delete()
+                except Exception:
+                    pass
+        else:
+            # Private chat - just answer
+            await message.answer(help_text, parse_mode="HTML")
 
     # Ignore other photos outside states to avoid confusion
     @dp.message(F.content_type == ContentType.PHOTO)
