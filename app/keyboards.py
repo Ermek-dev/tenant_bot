@@ -26,6 +26,16 @@ def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
 
+def staff_group_inline_kb() -> InlineKeyboardMarkup:
+    """Inline menu for staff group chat (silent interaction)."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📋 Все заявки", callback_data="group_all"),
+            InlineKeyboardButton(text="ℹ️ Помощь", callback_data="group_help"),
+        ]
+    ])
+
+
 def categories_inline_kb() -> InlineKeyboardMarkup:
     rows = []
     pair = []
@@ -53,7 +63,10 @@ def skip_or_done_kb() -> InlineKeyboardMarkup:
 def staff_task_kb(issue_id: int, *, assigned_to: str | None) -> InlineKeyboardMarkup:
     if assigned_to:
         return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Завершить", callback_data=f"complete:{issue_id}")]
+            [
+                InlineKeyboardButton(text="👥 Присоединиться", callback_data=f"join:{issue_id}"),
+                InlineKeyboardButton(text="✅ Завершить", callback_data=f"complete:{issue_id}"),
+            ]
         ])
     else:
         return InlineKeyboardMarkup(inline_keyboard=[
@@ -116,13 +129,14 @@ def send_issue_kb() -> InlineKeyboardMarkup:
     ])
 
 
-def all_issues_page_kb(issues: list, page: int, total_pages: int) -> InlineKeyboardMarkup:
+def all_issues_page_kb(issues: list, page: int, total_pages: int, is_admin: bool = False) -> InlineKeyboardMarkup:
     """Create inline keyboard for paginated all issues list.
     
     Args:
         issues: List of issue rows with id, status, assignee_name
         page: Current page number (0-indexed)
         total_pages: Total number of pages
+        is_admin: If True, show reassign buttons for assigned issues
     """
     rows = []
     
@@ -146,6 +160,21 @@ def all_issues_page_kb(issues: list, page: int, total_pages: int) -> InlineKeybo
             action_row = []
     if action_row:
         rows.append(action_row)
+    
+    # Admin reassign buttons for assigned issues
+    if is_admin:
+        reassign_row = []
+        for issue in issues:
+            if issue["status"] == "assigned":
+                reassign_row.append(InlineKeyboardButton(
+                    text=f"🔄 #{issue['id']}",
+                    callback_data=f"confirm_reassign:{issue['id']}"
+                ))
+                if len(reassign_row) == 3:
+                    rows.append(reassign_row)
+                    reassign_row = []
+        if reassign_row:
+            rows.append(reassign_row)
     
     # Navigation row
     nav_row = []
@@ -178,6 +207,16 @@ def confirm_action_kb(action: str, issue_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text=confirm_text, callback_data=confirm_data),
+            InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_confirm"),
+        ]
+    ])
+
+
+def confirm_reassign_kb(issue_id: int) -> InlineKeyboardMarkup:
+    """Confirmation keyboard for admin reassignment."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Да, переназначить", callback_data=f"reassign:{issue_id}"),
             InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_confirm"),
         ]
     ])

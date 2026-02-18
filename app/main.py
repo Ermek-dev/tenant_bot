@@ -14,7 +14,8 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (CallbackQuery, ContentType, InlineKeyboardMarkup,
                            InputMediaPhoto, Message, MediaUnion, BotCommand,
-                           BotCommandScopeDefault, BotCommandScopeChat)
+                           BotCommandScopeDefault, BotCommandScopeChat,
+                           ReplyKeyboardRemove)
 from aiogram.fsm.context import FSMContext
 
 from app.config import load_settings
@@ -22,6 +23,7 @@ from app import db
 from app.states import ReportStates, CompleteStates, CompanyStates, ClaimStates
 from app.keyboards import (
     main_menu,
+    staff_group_inline_kb,
     skip_or_done_kb,
     staff_task_kb,
     send_completion_kb,
@@ -34,6 +36,7 @@ from app.keyboards import (
     send_issue_kb,
     all_issues_page_kb,
     confirm_action_kb,
+    confirm_reassign_kb,
 )
 from app.utils import user_display_name
 
@@ -146,13 +149,28 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             )
             await message.answer("Либо используйте меню ниже.", reply_markup=main_menu(is_admin=is_admin))
             return
-        await message.answer(
-            "Добрый день!\n"
-            "Вас приветствует чат-бот Сервис РТС ЛТД.\n"
-            "С какой проблемой вы столкнулись?",
-            reply_markup=quick_start_kb(),
-        )
-        await message.answer("Выберите действие:", reply_markup=main_menu(is_admin=is_admin))
+        if message.chat.type in ("group", "supergroup"):
+            # In group chat, use INLINE menu and remove old keyboard
+            try:
+                rm_msg = await message.answer("♻️ Обновление меню...", reply_markup=ReplyKeyboardRemove())
+                await rm_msg.delete()
+            except Exception:
+                pass
+            
+            await message.answer(
+                "🤖 <b>Панель управления</b>\n👇 Используйте кнопки ниже для действий:",
+                parse_mode="HTML",
+                reply_markup=staff_group_inline_kb()
+            )
+        else:
+            # In private chat, show full welcome
+            await message.answer(
+                "Добрый день!\n"
+                "Вас приветствует чат-бот Сервис РТС ЛТД.\n"
+                "С какой проблемой вы столкнулись?",
+                reply_markup=quick_start_kb(),
+            )
+            await message.answer("Выберите действие:", reply_markup=main_menu(is_admin=is_admin))
 
     # Category selection via text buttons
     @dp.message(ReportStates.choosing_category)
@@ -790,6 +808,12 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     # New issue entrypoint via menu
     @dp.message(F.text == "🆕 Новая заявка")
     async def menu_new_issue(message: Message, state: FSMContext):
+        if message.chat.type in ("group", "supergroup"):
+            try: await message.delete()
+            except: pass
+            await bot.send_message(message.from_user.id, "Создание заявок доступно только в личном чате.")
+            return
+
         if message.from_user is None:
             return
         company = await db.get_user_company(message.from_user.id)
@@ -802,6 +826,10 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     # Quick start: begin new issue via inline button
     @dp.callback_query(F.data == "new_issue")
     async def cb_new_issue(cb: CallbackQuery, state: FSMContext):
+        if cb.message and cb.message.chat.type in ("group", "supergroup"):
+            await cb.answer("Создание заявок доступно только в личном чате.", show_alert=True)
+            return
+
         await cb.answer()
         if cb.from_user is None:
             return
@@ -818,12 +846,20 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     @dp.message(Command("my"))
     @dp.message(F.text == "📋 Мои заявки")
     async def my_issues(message: Message, state: FSMContext):
+        target_chat_id = message.chat.id
+        if message.chat.type in ("group", "supergroup"):
+            try: await message.delete()
+            except: pass
+            target_chat_id = message.from_user.id
+        
         await state.clear()  # Reset any active state
         if message.from_user is None:
             return
         rows = await db.user_issues(message.from_user.id, limit=5)
         if not rows:
-            await message.answer("У вас пока нет заявок.")
+            try:
+                await bot.send_message(target_chat_id, "У вас пока нет заявок.")
+            except: pass
             return
         lines = []
         status_map = {"open": ("🟡", "ожидает"), "assigned": ("🟠", "в работе"), "closed": ("🟢", "выполнена")}
@@ -833,7 +869,11 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             if r["status"] == "assigned" and r["assignee_name"]:
                 line += f" ({r['assignee_name']})"
             lines.append(line)
-        await message.answer("Ваши последние заявки:\n" + "\n".join(lines))
+        
+        try:
+            await bot.send_message(target_chat_id, "Ваши последние заявки:\n" + "\n".join(lines))
+        except Exception:
+            pass
 
     # All issues (for admin via button)
     @dp.message(F.text == "📋 Все заявки")
@@ -841,11 +881,31 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         await state.clear()  # Reset any active state
         if message.from_user is None:
             return
-        # Only admins can see all issues
-        if message.from_user.id not in admin_ids:
-            await message.answer("⛔️ Эта функция доступна только администраторам.")
+            
+        # Check if user is admin OR in staff chat
+        is_admin = message.from_user.id in admin_ids
+        
+        staff_chat_id = None
+        setting_chat = await db.get_setting("staff_chat_id")
+        if setting_chat:
+            with suppress(ValueError):
+                staff_chat_id = int(setting_chat)
+        is_staff_chat = message.chat.id == staff_chat_id
+
+        if not is_admin and not is_staff_chat:
+            await message.answer("⛔️ Эта функция доступна только администраторам или в группе сотрудников.")
             return
-        await _show_all_pending_issues(message, page=0)
+
+        # If in group/supergroup, delete request and answer in PM
+        target_chat_id = None
+        if message.chat.type in ("group", "supergroup"):
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            target_chat_id = message.from_user.id
+            
+        await _show_all_pending_issues(message, page=0, requester_user_id=message.from_user.id, target_chat_id=target_chat_id)
 
     # /all command for staff chat
     @dp.message(Command("all"))
@@ -868,15 +928,33 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             await message.answer("⛔️ Эта команда доступна только в группе сотрудников или для администраторов.")
             return
         
-        await _show_all_pending_issues(message, page=0)
+        # If in group, send to PM
+        target_chat_id = None
+        if message.chat.type in ("group", "supergroup"):
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            target_chat_id = message.from_user.id
+
+        await _show_all_pending_issues(message, page=0, requester_user_id=message.from_user.id, target_chat_id=target_chat_id)
 
     ISSUES_PER_PAGE = 5
 
-    async def _show_all_pending_issues(message: Message, page: int = 0):
-        """Helper to display paginated pending issues with action buttons."""
+    async def _show_all_pending_issues(message: Message, page: int = 0, requester_user_id: int | None = None, target_chat_id: int | None = None):
+        """Helper to display paginated pending issues with action buttons.
+        
+        Args:
+            message: The original message triggering the action
+            page: Page number
+            requester_user_id: User ID requesting the list
+            target_chat_id: ID of the chat to send the response to. If None, uses message.chat.id
+        """
+        chat_id = target_chat_id if target_chat_id else message.chat.id
+        
         total_count = await db.count_pending_issues()
         if total_count == 0:
-            await message.answer("✅ Нет невыполненных заявок.")
+            await bot.send_message(chat_id, "✅ Нет невыполненных заявок.")
             return
         
         total_pages = (total_count + ISSUES_PER_PAGE - 1) // ISSUES_PER_PAGE
@@ -891,15 +969,25 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             if r["user_name"]:
                 line += f"\n   👤 От: {r['user_name']}"
             if r["status"] == "assigned" and r["assignee_name"]:
-                line += f"\n   🛠 Исп.: {r['assignee_name']}"
+                # Show all assignees if available
+                issue_assignees = await db.get_issue_assignees(r['id'])
+                if issue_assignees and len(issue_assignees) > 1:
+                    line += f"\n   👥 Уч.: {_format_assignees(issue_assignees)}"
+                else:
+                    line += f"\n   🛠 Исп.: {r['assignee_name']}"
             lines.append(line)
         
+        user_is_admin = requester_user_id is not None and is_admin_user(requester_user_id)
         header = f"📋 <b>Невыполненные заявки</b> ({total_count}):\n\n"
-        legend = "\n\n<i>🛠=Взяться  ✅=Завершить</i>"
-        await message.answer(
-            header + "\n\n".join(lines) + legend, 
+        legend = "\n\n<i>🛠=Взяться  ✅=Завершить"
+        if user_is_admin:
+            legend += "  🔄=Переназначить"
+        legend += "</i>"
+        await bot.send_message(
+            chat_id,
+            header + "\n\n".join(lines) + legend,
             parse_mode="HTML",
-            reply_markup=all_issues_page_kb(list(rows), page, total_pages)
+            reply_markup=all_issues_page_kb(list(rows), page, total_pages, is_admin=user_is_admin)
         )
 
     # Pagination callback
@@ -930,17 +1018,26 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             if r["user_name"]:
                 line += f"\n   👤 От: {r['user_name']}"
             if r["status"] == "assigned" and r["assignee_name"]:
-                line += f"\n   🛠 Исп.: {r['assignee_name']}"
+                # Show all assignees if available
+                issue_assignees = await db.get_issue_assignees(r['id'])
+                if issue_assignees and len(issue_assignees) > 1:
+                    line += f"\n   👥 Уч.: {_format_assignees(issue_assignees)}"
+                else:
+                    line += f"\n   🛠 Исп.: {r['assignee_name']}"
             lines.append(line)
         
         header = f"📋 <b>Невыполненные заявки</b> ({total_count}):\n\n"
-        legend = "\n\n<i>🛠=Взяться  ✅=Завершить</i>"
+        user_is_admin = cb.from_user is not None and is_admin_user(cb.from_user.id)
+        legend = "\n\n<i>🛠=Взяться  ✅=Завершить"
+        if user_is_admin:
+            legend += "  🔄=Переназначить"
+        legend += "</i>"
         
         try:
             await cb.message.edit_text(
                 header + "\n\n".join(lines) + legend,
                 parse_mode="HTML",
-                reply_markup=all_issues_page_kb(list(rows), page, total_pages)
+                reply_markup=all_issues_page_kb(list(rows), page, total_pages, is_admin=user_is_admin)
             )
         except Exception:
             pass  # Message unchanged
@@ -1026,17 +1123,147 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
                     if r["user_name"]:
                         line += f"\n   👤 От: {r['user_name']}"
                     if r["status"] == "assigned" and r["assignee_name"]:
-                        line += f"\n   🛠 Исп.: {r['assignee_name']}"
+                        # Show all assignees if available
+                        issue_assignees = await db.get_issue_assignees(r['id'])
+                        if issue_assignees and len(issue_assignees) > 1:
+                            line += f"\n   👥 Уч.: {_format_assignees(issue_assignees)}"
+                        else:
+                            line += f"\n   🛠 Исп.: {r['assignee_name']}"
                     lines.append(line)
                 
                 header = f"📋 <b>Невыполненные заявки</b> ({total_count}):\n\n"
-                legend = "\n\n<i>🛠=Взяться  ✅=Завершить</i>"
+                user_is_admin = cb.from_user is not None and is_admin_user(cb.from_user.id)
+                legend = "\n\n<i>🛠=Взяться  ✅=Завершить"
+                if user_is_admin:
+                    legend += "  🔄=Переназначить"
+                legend += "</i>"
                 await cb.message.answer(
                     header + "\n\n".join(lines) + legend,
                     parse_mode="HTML",
-                    reply_markup=all_issues_page_kb(list(rows), 0, total_pages)
+                    reply_markup=all_issues_page_kb(list(rows), 0, total_pages, is_admin=user_is_admin)
                 )
         await cb.answer()
+
+    # Admin: confirm reassign from list
+    @dp.callback_query(F.data.startswith("confirm_reassign:"))
+    async def confirm_reassign_callback(cb: CallbackQuery, state: FSMContext):
+        if not cb.data or not cb.message:
+            await cb.answer()
+            return
+        if cb.from_user is None or not is_admin_user(cb.from_user.id):
+            await cb.answer("⛔️ Только администратор может переназначить.", show_alert=True)
+            return
+        issue_id = int(cb.data.split(":")[1])
+        issue = await db.get_issue(issue_id)
+        if not issue:
+            await cb.answer("⚠️ Заявка не найдена", show_alert=True)
+            return
+        if issue["status"] != "assigned":
+            await cb.answer("⚠️ Заявка не в работе", show_alert=True)
+            return
+
+        # Build assignees text
+        assignees = await db.get_issue_assignees(issue_id)
+        assignees_text = _format_assignees(assignees)
+        await cb.message.edit_text(
+            f"🔄 Переназначить заявку #{issue_id}?\n\n"
+            f"📋 {human_category(issue['category'])}\n"
+            f"👥 Текущие участники: {assignees_text}\n\n"
+            f"⚠️ Заявка будет сброшена в статус «ожидает» и появится в группе с кнопкой «Взяться».",
+            reply_markup=confirm_reassign_kb(issue_id)
+        )
+        await cb.answer()
+
+    # Admin: execute reassign
+    @dp.callback_query(F.data.startswith("reassign:"))
+    async def reassign_callback(cb: CallbackQuery, state: FSMContext):
+        if not cb.data or not cb.message:
+            await cb.answer()
+            return
+        if cb.from_user is None or not is_admin_user(cb.from_user.id):
+            await cb.answer("⛔️ Только администратор может переназначить.", show_alert=True)
+            return
+        issue_id = int(cb.data.split(":")[1])
+        issue = await db.get_issue(issue_id)
+        if not issue:
+            await cb.answer("⚠️ Заявка не найдена", show_alert=True)
+            return
+        if issue["status"] != "assigned":
+            await cb.answer("⚠️ Заявка не в работе", show_alert=True)
+            return
+
+        # Remember old assignees for notification
+        old_assignees = await db.get_issue_assignees(issue_id)
+        old_assignee_name = issue["assignee_name"] or "—"
+
+        # Reset the issue
+        ok = await db.reassign_issue(issue_id)
+        if not ok:
+            await cb.answer("Не удалось переназначить", show_alert=True)
+            return
+
+        # Update the admin's confirmation message
+        try:
+            if isinstance(cb.message, Message):
+                await cb.message.edit_text(
+                    f"✅ Заявка #{issue_id} переназначена.\n"
+                    f"Предыдущий исполнитель: {old_assignee_name}\n"
+                    f"Заявка отправлена в группу для переназначения.",
+                    reply_markup=None
+                )
+        except Exception:
+            pass
+
+        # Remove buttons from old staff message
+        try:
+            if issue["staff_chat_id"] and issue["staff_message_id"]:
+                await bot.edit_message_reply_markup(
+                    chat_id=issue["staff_chat_id"],
+                    message_id=issue["staff_message_id"],
+                    reply_markup=None
+                )
+        except Exception:
+            pass
+
+        # Send new message to staff group with "Взяться" button
+        staff_chat_id = None
+        setting_chat = await db.get_setting("staff_chat_id")
+        if setting_chat:
+            with suppress(ValueError):
+                staff_chat_id = int(setting_chat)
+        if staff_chat_id:
+            try:
+                comp = await db.get_company(issue["company_id"]) if issue["company_id"] else None
+                company_name = comp["name"] if comp else "—"
+                # Re-fetch the issue to get updated status
+                refreshed = await db.get_issue(issue_id)
+                if refreshed:
+                    new_msg = await bot.send_message(
+                        chat_id=staff_chat_id,
+                        text=f"🔄 Заявка #{issue_id} переназначена админом\n"
+                             f"🏢 {company_name}\n"
+                             f"📋 {human_category(issue['category'])}\n"
+                             f"👤 От: {issue['user_name']}\n\n"
+                             f"{issue['description']}\n\n"
+                             f"Предыдущий исп.: {old_assignee_name}",
+                        reply_markup=staff_task_kb(issue_id, assigned_to=None)
+                    )
+                    await db.set_staff_message(issue_id, staff_chat_id, new_msg.message_id)
+            except Exception as e:
+                logger.error(f"Failed to send reassign message for issue #{issue_id}: {e}")
+
+        # Notify old assignees that the task was reassigned
+        for a in old_assignees:
+            try:
+                await bot.send_message(
+                    a["user_id"],
+                    f"🔄 Заявка #{issue_id} была переназначена администратором. "
+                    f"Вы больше не ответственны за эту заявку."
+                )
+            except Exception:
+                pass  # User may have blocked the bot
+
+        await cb.answer(f"Заявка #{issue_id} переназначена")
 
     # Noop callback for page number button
     @dp.callback_query(F.data == "noop")
@@ -1046,6 +1273,12 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     # Bind company via menu
     @dp.message(F.text == "🔑 Привязать предприятие")
     async def menu_bind_company(message: Message, state: FSMContext):
+        if message.chat.type in ("group", "supergroup"):
+            try: await message.delete()
+            except: pass
+            await bot.send_message(message.from_user.id, "Привязка предприятия доступна только в личном чате.")
+            return
+
         await state.clear()  # Reset any active state first
         await state.set_state(CompanyStates.entering_code)
         await message.answer("Введите код предприятия (или /cancel для отмены):")
@@ -1060,8 +1293,21 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
     @dp.message(Command("cancel"))
     async def cmd_cancel(message: Message, state: FSMContext):
         await state.clear()
-        is_admin = is_admin_user(message.from_user.id) if message.from_user else False
-        await message.answer("Действие отменено.", reply_markup=main_menu(is_admin=is_admin))
+        
+        reply_markup = None
+        if message.chat.type in ("group", "supergroup"):
+            # In group chat, remove old keyboard and show inline menu
+            try:
+                rm_msg = await message.answer("♻️ Обновление меню...", reply_markup=ReplyKeyboardRemove())
+                await rm_msg.delete()
+            except Exception:
+                pass
+            reply_markup = staff_group_inline_kb()
+            await message.answer("🤖 <b>Панель управления</b>", parse_mode="HTML", reply_markup=reply_markup)
+        else:
+            is_admin = is_admin_user(message.from_user.id) if message.from_user else False
+            reply_markup = main_menu(is_admin=is_admin)
+            await message.answer("Действие отменено.", reply_markup=reply_markup)
 
     # Utility: get chat id and user id for configuration
     @dp.message(Command("chatid"))
@@ -1224,11 +1470,14 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
                 if staff_chat_id:
                     # Отправляем НОВОЕ сообщение с кнопкой "Завершить" (внизу чата!)
                     category_name = human_category(issue["category"]) if issue["category"] else ""
+                    # Get all assignees for this issue
+                    assignees = await db.get_issue_assignees(issue_id)
+                    assignees_text = _format_assignees(assignees)
                     new_staff_msg = await bot.send_message(
                         chat_id=staff_chat_id,
                         text=f"🔧 Заявка #{issue_id} в работе\n"
                              f"📁 {category_name}\n"
-                             f"👤 Исполнитель: {assignee_name}\n"
+                             f"👥 Участники: {assignees_text}\n"
                              f"📅 Срок: {deadline_text}",
                         reply_markup=staff_task_kb(issue_id, assigned_to=assignee_name)
                     )
@@ -1310,11 +1559,14 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             if staff_chat_id:
                 # Отправляем НОВОЕ сообщение с кнопкой "Завершить" (внизу чата!)
                 category_name = human_category(issue["category"]) if issue["category"] else ""
+                # Get all assignees for this issue
+                assignees = await db.get_issue_assignees(issue_id)
+                assignees_text = _format_assignees(assignees)
                 new_staff_msg = await bot.send_message(
                     chat_id=staff_chat_id,
                     text=f"🔧 Заявка #{issue_id} в работе\n"
                          f"📁 {category_name}\n"
-                         f"👤 Исполнитель: {assignee_name}\n"
+                         f"👥 Участники: {assignees_text}\n"
                          f"📅 Срок: {custom_deadline_text}",
                     reply_markup=staff_task_kb(issue_id, assigned_to=assignee_name)
                 )
@@ -1334,6 +1586,66 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         if cb.message:
             await cb.message.answer("Действие отменено.")
 
+    # Staff: join an existing task as helper
+    @dp.callback_query(F.data.startswith("join:"))
+    async def cb_join(cb: CallbackQuery, state: FSMContext):
+        if not cb.data:
+            await cb.answer()
+            return
+        issue_id = int(cb.data.split(":", 1)[1])
+        issue = await db.get_issue(issue_id)
+        if not issue:
+            await cb.answer("Заявка не найдена", show_alert=True)
+            return
+        if issue["status"] != "assigned":
+            await cb.answer("Заявка не в работе", show_alert=True)
+            return
+        if cb.from_user is None:
+            return
+
+        # Check if already assigned
+        already = await db.is_issue_assignee(issue_id, cb.from_user.id)
+        if already:
+            await cb.answer("Вы уже участвуете в этой заявке", show_alert=True)
+            return
+
+        joiner_name = display_from(cb)
+        added = await db.add_issue_assignee(issue_id, cb.from_user.id, joiner_name, is_lead=False)
+        if not added:
+            await cb.answer("Не удалось присоединиться", show_alert=True)
+            return
+
+        # Build updated assignees text
+        assignees = await db.get_issue_assignees(issue_id)
+        assignees_text = _format_assignees(assignees)
+
+        # Update the staff message to show all participants
+        try:
+            if isinstance(cb.message, Message):
+                old_text = cb.message.text or cb.message.caption or ""
+                # Add/update participants line
+                new_text = old_text
+                if "👥 Участники:" in old_text:
+                    # Replace existing participants line
+                    lines = old_text.split("\n")
+                    new_lines = []
+                    for line in lines:
+                        if line.startswith("👥 Участники:"):
+                            new_lines.append(f"👥 Участники: {assignees_text}")
+                        else:
+                            new_lines.append(line)
+                    new_text = "\n".join(new_lines)
+                else:
+                    new_text = old_text + f"\n👥 Участники: {assignees_text}"
+                await cb.message.edit_text(
+                    new_text,
+                    reply_markup=staff_task_kb(issue_id, assigned_to=issue["assignee_name"])
+                )
+        except Exception:
+            pass
+
+        await cb.answer(f"Вы присоединились к заявке #{issue_id}")
+
     # Staff: complete flow start
     @dp.callback_query(F.data.startswith("complete:"))
     async def cb_complete(cb: CallbackQuery, state: FSMContext):
@@ -1345,8 +1657,12 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         if not issue:
             await cb.answer("Заявка не найдена", show_alert=True)
             return
-        if cb.from_user is None or issue["assignee_user_id"] != cb.from_user.id:
-            await cb.answer("Только ответственный может завершить.", show_alert=True)
+        if cb.from_user is None:
+            return
+        # Allow any assignee (lead or helper) to complete
+        is_assignee = await db.is_issue_assignee(issue_id, cb.from_user.id)
+        if not is_assignee:
+            await cb.answer("Только участники заявки могут завершить.", show_alert=True)
             return
         await state.update_data(complete_issue_id=issue_id, completion_text="", completion_photos=[])
         await state.set_state(CompleteStates.collecting_photos)  # Skip text step, go straight to photos
@@ -1413,10 +1729,15 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             await db.add_issue_photo(issue_id, fid, is_completion=True, uploader_user_id=cb.from_user.id)
         await db.complete_issue(issue_id)
 
+        # Build assignees text for notification
+        assignees = await db.get_issue_assignees(issue_id)
+        assignees_text = _format_assignees(assignees)
+
         # Notify tenant
         tenant_chat_id = issue["tenant_chat_id"]
         notify_text = (
             f"Ваша заявка #{issue_id} выполнена.\n"
+            f"👥 Исполнители: {assignees_text}\n"
             f"Комментарий исполнителя: {text or 'без комментария'}"
         )
         try:
@@ -1434,7 +1755,7 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
         # Update staff message
         try:
             comp = await db.get_company(issue["company_id"]) if issue["company_id"] else None
-            text_staff = staff_message_text(issue, override_status="closed", company_name=(comp["name"] if comp else None))
+            text_staff = staff_message_text(issue, override_status="closed", company_name=(comp["name"] if comp else None), assignees_text=assignees_text)
             await bot.edit_message_text(
                 chat_id=issue["staff_chat_id"],
                 message_id=issue["staff_message_id"],
@@ -1479,6 +1800,43 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             )
 
 
+    # Group Menu Callbacks
+    @dp.callback_query(F.data == "group_all")
+    async def cb_group_all(cb: CallbackQuery):
+        await cb.answer("Отправляю список заявок в ЛС...", show_alert=False)
+        try:
+            # Need to pass target_chat_id explicitly
+            await _show_all_pending_issues(cb.message, page=0, requester_user_id=cb.from_user.id, target_chat_id=cb.from_user.id)
+        except Exception:
+            await cb.answer("Не удалось отправить сообщение. Напишите боту в ЛС /start.", show_alert=True)
+
+    @dp.callback_query(F.data == "group_help")
+    async def cb_group_help(cb: CallbackQuery):
+        await cb.answer("Отправляю справку в ЛС...", show_alert=False)
+        
+        # Construct help text (simplified logic compared to cmd_help)
+        is_admin = is_admin_user(cb.from_user.id)
+        
+        help_text = (
+            "📚 <b>Справка по командам</b>\n\n"
+            "<b>Для сотрудников:</b>\n"
+            "Вы можете использовать кнопки в закрепленном сообщении группы.\n"
+            "/start — обновить меню\n"
+            "/my — мои последние заявки (в ЛС)\n"
+            "/cancel — отменить текущее действие\n\n"
+        )
+        if is_admin:
+            help_text += (
+                "<b>Для администратора:</b>\n"
+                "/company_add — добавить предприятие\n"
+                "/company_list — список предприятий\n\n"
+            )
+        
+        try:
+            await bot.send_message(cb.from_user.id, help_text, parse_mode="HTML")
+        except Exception:
+            await cb.answer("Не удалось отправить сообщение. Напишите боту в ЛС /start.", show_alert=True)
+
     # Help command - короткая информативная версия
     @dp.message(Command("help"))
     async def cmd_help(message: Message):
@@ -1522,10 +1880,35 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             )
         
         help_text += (
-            "\n💡 <b>Совет:</b> Используйте кнопку '/' для быстрого доступа к командам!"
-        )
-        
-        await message.answer(help_text, parse_mode="HTML")
+        "\n💡 <b>Совет:</b> Используйте кнопку '/' для быстрого доступа к командам!"
+    )
+    
+        # If in group chat, send to PM and delete original message to avoid spam
+        if message.chat.type in ("group", "supergroup"):
+            # Try to delete the command message
+            try:
+                await message.delete()
+            except Exception:
+                pass  # Maybe no delete permissions
+                
+            # Send help to PM
+            try:
+                await bot.send_message(message.from_user.id, help_text, parse_mode="HTML")
+            except Exception:
+                # If user hasn't started bot in PM, we can't message them.
+                # In this case, maybe send a temporary ephemeral-like message or just ignore.
+                # Let's send a short message in group that auto-deletes?
+                # Or just leave it be. For now, let's try to send a hint in group.
+                try:
+                    msg = await message.answer(f"{user_display_name(message.from_user)}, чтобы получить справку, напишите мне в ЛС: @{(await bot.get_me()).username}")
+                    # Wait 5 sec and delete
+                    await asyncio.sleep(5)
+                    await msg.delete()
+                except Exception:
+                    pass
+        else:
+            # Private chat - just answer
+            await message.answer(help_text, parse_mode="HTML")
 
     # Ignore other photos outside states to avoid confusion
     @dp.message(F.content_type == ContentType.PHOTO)
@@ -1547,7 +1930,21 @@ def human_category(code: str) -> str:
     return code
 
 
-def staff_message_text(issue_row, *, override_assignee: Optional[str] = None, override_status: Optional[str] = None, company_name: Optional[str] = None) -> str:
+def _format_assignees(assignees_rows) -> str:
+    """Format list of assignee rows into human-readable string."""
+    if not assignees_rows:
+        return "—"
+    parts = []
+    for a in assignees_rows:
+        name = a["user_name"] or "—"
+        if a["is_lead"]:
+            parts.append(f"{name} (ведущий)")
+        else:
+            parts.append(name)
+    return ", ".join(parts)
+
+
+def staff_message_text(issue_row, *, override_assignee: Optional[str] = None, override_status: Optional[str] = None, company_name: Optional[str] = None, assignees_text: Optional[str] = None) -> str:
     status = override_status or issue_row["status"]
     assignee = override_assignee or issue_row["assignee_name"]
     deadline = issue_row["deadline"]
@@ -1560,7 +1957,9 @@ def staff_message_text(issue_row, *, override_assignee: Optional[str] = None, ov
         f"Описание:\n{issue_row['description']}\n\n"
         f"Статус: {status}"
     )
-    if assignee:
+    if assignees_text:
+        text += f"\n👥 Участники: {assignees_text}"
+    elif assignee:
         text += f"\nОтветственный: {assignee}"
     if deadline:
         # Parse deadline to show readable format
