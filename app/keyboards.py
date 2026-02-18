@@ -26,6 +26,16 @@ def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
 
+def staff_group_inline_kb() -> InlineKeyboardMarkup:
+    """Inline menu for staff group chat (silent interaction)."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📋 Все заявки", callback_data="group_all"),
+            InlineKeyboardButton(text="ℹ️ Помощь", callback_data="group_help"),
+        ]
+    ])
+
+
 def categories_inline_kb() -> InlineKeyboardMarkup:
     rows = []
     pair = []
