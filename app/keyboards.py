@@ -36,6 +36,16 @@ def staff_group_inline_kb() -> InlineKeyboardMarkup:
     ])
 
 
+def rating_kb(issue_id: int) -> InlineKeyboardMarkup:
+    """Star rating buttons (1-5) for a completed issue."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=f"{'⭐' * i}", callback_data=f"rate:{issue_id}:{i}")
+            for i in range(1, 6)
+        ]
+    ])
+
+
 def categories_inline_kb() -> InlineKeyboardMarkup:
     rows = []
     pair = []
