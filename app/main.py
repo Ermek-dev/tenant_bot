@@ -37,6 +37,7 @@ from app.keyboards import (
     all_issues_page_kb,
     confirm_action_kb,
     confirm_reassign_kb,
+    rating_kb,
 )
 from app.utils import user_display_name
 
@@ -1760,7 +1761,7 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
                 chat_id=issue["staff_chat_id"],
                 message_id=issue["staff_message_id"],
                 text=text_staff,
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[]),
+                reply_markup=rating_kb(issue_id),
             )
         except Exception:
             pass
@@ -1798,6 +1799,126 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
                 "Когда будете готовы — нажмите «✅ Отправить».",
                 reply_markup=skip_or_done_kb(),
             )
+
+    # Rating callback
+    @dp.callback_query(F.data.startswith("rate:"))
+    async def cb_rate_issue(cb: CallbackQuery):
+        if not cb.data or not cb.from_user:
+            await cb.answer()
+            return
+        
+        parts = cb.data.split(":")
+        if len(parts) != 3:
+            await cb.answer("Ошибка данных", show_alert=True)
+            return
+        
+        issue_id = int(parts[1])
+        score = int(parts[2])
+        
+        if score < 1 or score > 5:
+            await cb.answer("Неверная оценка", show_alert=True)
+            return
+        
+        # Check that rater is NOT an assignee (can't rate own work)
+        is_assignee = await db.is_issue_assignee(issue_id, cb.from_user.id)
+        if is_assignee:
+            await cb.answer("❗ Вы не можете оценить свою работу.", show_alert=True)
+            return
+        
+        # Check that issue exists and is closed
+        issue = await db.get_issue(issue_id)
+        if not issue or issue["status"] != "closed":
+            await cb.answer("Заявка не найдена или не завершена", show_alert=True)
+            return
+        
+        rater_name = display_from(cb)
+        await db.rate_issue(issue_id, score, cb.from_user.id, rater_name)
+        
+        # Update the message to show rating
+        stars_filled = "★" * score + "☆" * (5 - score)
+        rating_line = f"\n⭐ Оценка: {stars_filled} ({score}/5) — {rater_name}"
+        
+        try:
+            if isinstance(cb.message, Message):
+                old_text = cb.message.text or ""
+                # Remove old rating line if exists
+                lines = old_text.split("\n")
+                new_lines = [l for l in lines if not l.startswith("⭐ Оценка:")]
+                new_text = "\n".join(new_lines) + rating_line
+                
+                await cb.message.edit_text(
+                    new_text,
+                    reply_markup=rating_kb(issue_id)
+                )
+        except Exception:
+            pass
+        
+        await cb.answer(f"Оценка {score}/5 сохранена ✅")
+
+    # /stats command — admin monthly analytics
+    @dp.message(Command("stats"))
+    async def cmd_stats(message: Message):
+        if message.from_user is None:
+            return
+        
+        if not is_admin_user(message.from_user.id):
+            await message.answer("⛔️ Эта команда доступна только администраторам.")
+            return
+        
+        # Parse optional month argument: /stats or /stats 2026-02
+        from datetime import datetime as dt
+        args = (message.text or "").split()
+        now = dt.now()
+        year, month = now.year, now.month
+        
+        if len(args) >= 2:
+            try:
+                parts = args[1].split("-")
+                year = int(parts[0])
+                month = int(parts[1])
+            except (ValueError, IndexError):
+                await message.answer("Формат: /stats или /stats 2026-02")
+                return
+        
+        stats = await db.get_staff_stats(year, month)
+        
+        month_names = ["", "январь", "февраль", "март", "апрель", "май", "июнь",
+                       "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
+        header = f"📊 <b>Статистика за {month_names[month]} {year}</b>\n\n"
+        
+        if not stats:
+            await message.answer(header + "Нет данных за этот период.", parse_mode="HTML")
+            return
+        
+        lines = []
+        for s in stats:
+            rating_str = f"★{s['avg_rating']}" if s["avg_rating"] else "—"
+            
+            # Category breakdown
+            cat_parts = []
+            for cat, cnt in sorted(s["categories"].items(), key=lambda x: x[1], reverse=True):
+                cat_parts.append(f"{human_category(cat)}: {cnt}")
+            cats_str = ", ".join(cat_parts)
+            
+            lines.append(
+                f"👤 <b>{s['user_name']}</b>\n"
+                f"   Заявок: {s['total']} │ Оценка: {rating_str}\n"
+                f"   📁 {cats_str}"
+            )
+        
+        text = header + "\n\n".join(lines)
+        
+        # Send to PM if in group
+        target_chat_id = message.chat.id
+        if message.chat.type in ("group", "supergroup"):
+            try: await message.delete()
+            except: pass
+            target_chat_id = message.from_user.id
+        
+        try:
+            await bot.send_message(target_chat_id, text, parse_mode="HTML")
+        except Exception:
+            pass
 
 
     # Group Menu Callbacks
