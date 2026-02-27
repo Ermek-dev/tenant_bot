@@ -91,6 +91,7 @@ async def init_db(path: str) -> aiosqlite.Connection:
     await _migrate_add_company_id_column()
     await _migrate_add_deadline_column()
     await _migrate_create_issue_assignees_table()
+    await _migrate_add_rating_columns()
     return _conn
 
 
@@ -435,3 +436,88 @@ async def is_issue_assignee(issue_id: int, user_id: int) -> bool:
         (issue_id, user_id),
     ) as cur:
         return (await cur.fetchone()) is not None
+
+
+async def _migrate_add_rating_columns() -> None:
+    conn = _require_conn()
+    try:
+        await conn.execute("ALTER TABLE issues ADD COLUMN rating INTEGER")
+        await conn.execute("ALTER TABLE issues ADD COLUMN rated_by_user_id INTEGER")
+        await conn.execute("ALTER TABLE issues ADD COLUMN rated_by_name TEXT")
+        await conn.commit()
+    except Exception:
+        pass  # Columns already exist
+
+
+# --- Rating helpers ---
+
+async def rate_issue(issue_id: int, rating: int, user_id: int, user_name: str) -> bool:
+    """Save or update a rating for a completed issue. Returns True on success."""
+    conn = _require_conn()
+    now = datetime.now(timezone.utc).isoformat()
+    await conn.execute(
+        "UPDATE issues SET rating=?, rated_by_user_id=?, rated_by_name=?, updated_at=? WHERE id=? AND status='closed'",
+        (rating, user_id, user_name, now, issue_id),
+    )
+    await conn.commit()
+    return True
+
+
+async def get_staff_stats(year: int, month: int) -> List[Dict[str, Any]]:
+    """Get monthly statistics per staff member: issue count, avg rating, category breakdown.
+    
+    Returns list of dicts: {user_id, user_name, total, avg_rating, categories: {cat: count}}
+    """
+    conn = _require_conn()
+    conn.row_factory = aiosqlite.Row
+    # Date range for the month
+    start = f"{year:04d}-{month:02d}-01"
+    if month == 12:
+        end = f"{year + 1:04d}-01-01"
+    else:
+        end = f"{year:04d}-{month + 1:02d}-01"
+    
+    # Get all closed issues in the date range with their assignees
+    async with conn.execute("""
+        SELECT ia.user_id, ia.user_name, i.id as issue_id, i.category, i.rating
+        FROM issue_assignees ia
+        JOIN issues i ON ia.issue_id = i.id
+        WHERE i.status = 'closed'
+          AND i.updated_at >= ? AND i.updated_at < ?
+        ORDER BY ia.user_id
+    """, (start, end)) as cur:
+        rows = list(await cur.fetchall())
+    
+    # Aggregate per user
+    from collections import defaultdict
+    users: Dict[int, Dict[str, Any]] = {}
+    for r in rows:
+        uid = r["user_id"]
+        if uid not in users:
+            users[uid] = {
+                "user_id": uid,
+                "user_name": r["user_name"],
+                "total": 0,
+                "ratings": [],
+                "categories": defaultdict(int),
+            }
+        users[uid]["total"] += 1
+        if r["rating"] is not None:
+            users[uid]["ratings"].append(r["rating"])
+        cat = r["category"] or "Без категории"
+        users[uid]["categories"][cat] += 1
+    
+    result = []
+    for u in users.values():
+        avg = round(sum(u["ratings"]) / len(u["ratings"]), 1) if u["ratings"] else None
+        result.append({
+            "user_id": u["user_id"],
+            "user_name": u["user_name"],
+            "total": u["total"],
+            "avg_rating": avg,
+            "categories": dict(u["categories"]),
+        })
+    
+    # Sort by total desc
+    result.sort(key=lambda x: x["total"], reverse=True)
+    return result
