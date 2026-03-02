@@ -1950,7 +1950,8 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
             help_text += (
                 "<b>Для администратора:</b>\n"
                 "/company_add — добавить предприятие\n"
-                "/company_list — список предприятий\n\n"
+                "/company_list — список предприятий\n"
+                "/stats — статистика по сотрудникам за месяц\n\n"
             )
         
         try:
@@ -1997,6 +1998,7 @@ def register_handlers(dp: Dispatcher, bot: Bot, admin_ids: set[int]):
                 "/all — все невыполненные заявки\n"
                 "/company_create &lt;название&gt; [код] — создать предприятие\n"
                 "/company_list — список предприятий\n"
+                "/stats — статистика по сотрудникам за месяц\n"
                 "/setstaffchat — установить группу сотрудников (выполнить в группе)\n"
             )
         
