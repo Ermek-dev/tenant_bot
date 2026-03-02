@@ -37,10 +37,12 @@ def staff_group_inline_kb() -> InlineKeyboardMarkup:
 
 
 def rating_kb(issue_id: int) -> InlineKeyboardMarkup:
-    """Star rating buttons (1-5) for a completed issue."""
+    """Numeric rating buttons (1-5) with emoji labels for a completed issue."""
+    labels = {1: "1 😞", 2: "2 😐", 3: "3 🙂", 4: "4 😊", 5: "5 🔥"}
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Оцените качество работы:", callback_data="noop")],
         [
-            InlineKeyboardButton(text=f"{'⭐' * i}", callback_data=f"rate:{issue_id}:{i}")
+            InlineKeyboardButton(text=labels[i], callback_data=f"rate:{issue_id}:{i}")
             for i in range(1, 6)
         ]
     ])
